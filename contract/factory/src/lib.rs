@@ -40,6 +40,16 @@ pub struct FactoryContract;
 impl FactoryContract {
     /// Initialise the contract, setting the admin address.
     /// Must be called exactly once after deployment.
+    ///
+    /// # Arguments
+    /// * `env` - The Soroban environment.
+    /// * `admin` - Address to designate as the contract administrator.
+    ///
+    /// # Errors
+    /// Panics with `"already initialized"` if an admin has already been set.
+    ///
+    /// # Authorization
+    /// None — permissionless; must be called immediately after deploy.
     pub fn initialize(env: Env, admin: Address) {
         if env.storage().instance().has(&ADMIN_KEY) {
             panic!("already initialized");
@@ -48,6 +58,15 @@ impl FactoryContract {
     }
 
     /// Return the current admin address.
+    ///
+    /// # Arguments
+    /// * `env` - The Soroban environment.
+    ///
+    /// # Errors
+    /// Panics with `"not initialized"` if [`initialize`](Self::initialize) has not been called.
+    ///
+    /// # Authorization
+    /// None — read-only, open to any caller.
     pub fn admin(env: Env) -> Address {
         env.storage()
             .instance()
@@ -59,6 +78,18 @@ impl FactoryContract {
 
     /// Propose a WASM upgrade. The new hash is stored together with the
     /// earliest timestamp at which `execute_upgrade` may be called.
+    ///
+    /// # Arguments
+    /// * `env` - The Soroban environment.
+    /// * `new_wasm_hash` - 32-byte hash of the new contract WASM to deploy.
+    ///
+    /// # Errors
+    /// Panics with `"not initialized"` if [`initialize`](Self::initialize) has not been called.
+    ///
+    /// # Authorization
+    /// Requires admin signature (`admin.require_auth()`).
+    ///
+    /// # Events
     /// Emits `UpgradeProposed(new_wasm_hash, execute_after)`.
     pub fn propose_upgrade(env: Env, new_wasm_hash: BytesN<32>) {
         let admin: Address = env
@@ -83,7 +114,19 @@ impl FactoryContract {
     }
 
     /// Execute a previously proposed upgrade after the 48-hour timelock.
-    /// Panics if there is no pending proposal or the timelock has not elapsed.
+    ///
+    /// # Arguments
+    /// * `env` - The Soroban environment.
+    ///
+    /// # Errors
+    /// Panics with `"not initialized"` if admin is not set.
+    /// Panics with `"no pending upgrade"` if no proposal exists.
+    /// Panics with `"timelock has not expired"` if called before the timelock elapses.
+    ///
+    /// # Authorization
+    /// Requires admin signature (`admin.require_auth()`).
+    ///
+    /// # Events
     /// Emits `UpgradeExecuted(new_wasm_hash)`.
     pub fn execute_upgrade(env: Env) {
         let admin: Address = env
@@ -121,7 +164,18 @@ impl FactoryContract {
     }
 
     /// Cancel a pending upgrade proposal. Admin-only.
-    /// Panics if there is no pending proposal.
+    ///
+    /// # Arguments
+    /// * `env` - The Soroban environment.
+    ///
+    /// # Errors
+    /// Panics with `"not initialized"` if admin is not set.
+    /// Panics with `"no pending upgrade to cancel"` if no proposal exists.
+    ///
+    /// # Authorization
+    /// Requires admin signature (`admin.require_auth()`).
+    ///
+    /// # Events
     /// Emits `UpgradeCancelled`.
     pub fn cancel_upgrade(env: Env) {
         let admin: Address = env
@@ -143,6 +197,12 @@ impl FactoryContract {
 
     /// Return the pending WASM hash and the earliest execution timestamp,
     /// or `None` if no upgrade has been proposed.
+    ///
+    /// # Arguments
+    /// * `env` - The Soroban environment.
+    ///
+    /// # Authorization
+    /// None — read-only, open to any caller.
     pub fn pending_upgrade(env: Env) -> Option<(BytesN<32>, u64)> {
         let hash: Option<BytesN<32>> = env.storage().instance().get(&PENDING_HASH_KEY);
         let after: Option<u64> = env.storage().instance().get(&EXECUTE_AFTER_KEY);
