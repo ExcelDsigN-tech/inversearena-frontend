@@ -463,3 +463,47 @@ fn test_unauthorized_cancel_upgrade_panics() {
     client.initialize(&admin);
     client.cancel_upgrade();
 }
+
+// ── Queries tests ────────────────────────────────────────────────────────────
+
+#[test]
+fn test_get_arena() {
+    let (env, admin, client) = setup();
+    client.set_arena_wasm_hash(&dummy_hash(&env));
+    let creator = Address::generate(&env);
+    client.create_pool(&admin, &creator, &1u32, &10u32, &MIN_STAKE);
+
+    let arena = client.get_arena(&1u32).unwrap();
+    assert_eq!(arena.pool_id, 1);
+    assert_eq!(arena.creator, creator);
+    assert_eq!(arena.capacity, 10);
+    assert_eq!(arena.stake_amount, MIN_STAKE);
+}
+
+#[test]
+fn test_get_arenas_pagination() {
+    let (env, admin, client) = setup();
+    client.set_arena_wasm_hash(&dummy_hash(&env));
+    let creator = Address::generate(&env);
+
+    for i in 1..=5 {
+        client.create_pool(&admin, &creator, &i, &10u32, &MIN_STAKE);
+    }
+
+    let all = client.get_arenas(&0u32, &10u32);
+    assert_eq!(all.len(), 5);
+    
+    let page1 = client.get_arenas(&0u32, &2u32);
+    assert_eq!(page1.len(), 2);
+    assert_eq!(page1.get(0).unwrap().pool_id, 1);
+    assert_eq!(page1.get(1).unwrap().pool_id, 2);
+
+    let page2 = client.get_arenas(&2u32, &2u32);
+    assert_eq!(page2.len(), 2);
+    assert_eq!(page2.get(0).unwrap().pool_id, 3);
+    assert_eq!(page2.get(1).unwrap().pool_id, 4);
+
+    let page3 = client.get_arenas(&4u32, &2u32);
+    assert_eq!(page3.len(), 1);
+    assert_eq!(page3.get(0).unwrap().pool_id, 5);
+}
