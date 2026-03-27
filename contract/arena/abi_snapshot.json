@@ -1,0 +1,47 @@
+{
+  "exported_functions": [
+    "init",
+    "set_token",
+    "set_winner",
+    "claim",
+    "initialize",
+    "admin",
+    "set_admin",
+    "pause",
+    "unpause",
+    "is_paused",
+    "set_capacity",
+    "get_arena_state",
+    "join",
+    "start_round",
+    "submit_choice",
+    "timeout_round",
+    "resolve_round",
+    "get_config",
+    "get_round",
+    "get_choice",
+    "propose_upgrade",
+    "execute_upgrade",
+    "cancel_upgrade",
+    "pending_upgrade",
+    "get_user_state",
+    "get_full_state"
+  ],
+  "struct_schemas": {
+    "UserStateView": {
+      "fields": [
+        { "name": "is_survivor",   "type": "bool" },
+        { "name": "has_submitted", "type": "bool" },
+        { "name": "choice",        "type": "Choice" },
+        { "name": "has_claimed",   "type": "bool" }
+      ]
+    },
+    "FullStateView": {
+      "fields": [
+        { "name": "config",    "type": "ArenaConfig" },
+        { "name": "round",     "type": "RoundState" },
+        { "name": "is_paused", "type": "bool" }
+      ]
+    }
+  }
+}

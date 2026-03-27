@@ -76,10 +76,45 @@ No custom Soroban storage keys are currently defined or used.
 | `get_config` | `Config` | — | — |
 | `get_round` | `Round` | — | — |
 | `get_choice` | `Submission(n, player)` | — | — |
+| `get_user_state` | `Round`, `Survivor(player)`, `Submission(n, player)`, `PrizeClaimed(player)` | — | — |
+| `get_full_state` | `Config`, `Round`, `PAUSED` (instance) | — | — |
 | `initialize` | `ADMIN` (instance) | `ADMIN` (instance) | — |
 | `propose_upgrade` | `ADMIN` (instance) | `P_HASH`, `P_AFTER` (instance) | — |
 | `execute_upgrade` | `ADMIN`, `P_AFTER`, `P_HASH` (instance) | removes `P_HASH`, `P_AFTER` (instance) | — |
 | `cancel_upgrade` | `ADMIN`, `P_HASH` (instance) | removes `P_HASH`, `P_AFTER` (instance) | — |
+
+## View Functions
+
+These read-only functions expose aggregated contract state for frontend clients and indexers. They require no authorization and do not modify state.
+
+### `get_user_state(player: Address) → Result<UserStateView, ArenaError>`
+
+Returns a snapshot of a single player's participation status.
+
+**Return type: `UserStateView`**
+
+| Field | Type | Description |
+| --- | --- | --- |
+| `is_survivor` | `bool` | `true` if the player has a `Survivor` entry (has joined the arena) |
+| `has_submitted` | `bool` | `true` if the player has submitted a choice for the current round |
+| `choice` | `Choice` | The player's `Heads`/`Tails` submission (only meaningful when `has_submitted` is `true`) |
+| `has_claimed` | `bool` | `true` if the player has already claimed their prize via `claim()` |
+
+**Errors**: `ArenaError::NotInitialized` if `init` has not been called.
+
+### `get_full_state() → Result<FullStateView, ArenaError>`
+
+Returns a combined snapshot of the entire contract state in a single call, reducing the number of RPC round-trips needed by the frontend.
+
+**Return type: `FullStateView`**
+
+| Field | Type | Description |
+| --- | --- | --- |
+| `config` | `ArenaConfig` | Current round speed configuration (see `ArenaConfig`) |
+| `round` | `RoundState` | Current round state (see `RoundState`) |
+| `is_paused` | `bool` | Whether the contract is currently paused |
+
+**Errors**: `ArenaError::NotInitialized` if `init` has not been called.
 
 ## TTL Policy Baseline
 
