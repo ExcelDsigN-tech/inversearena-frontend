@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "arena",
     "factory",
+    "mock_vault",
     "payout",
     "staking",
 ]

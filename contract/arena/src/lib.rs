@@ -4,7 +4,7 @@ mod bounds;
 mod invariants;
 
 use soroban_sdk::{
-    Address, BytesN, Env, Symbol, Vec, contract, contracterror, contractimpl, contracttype,
+    Address, BytesN, Env, IntoVal, Symbol, Vec, contract, contracterror, contractimpl, contracttype,
     symbol_short, token,
 };
 
@@ -21,6 +21,7 @@ const PRIZE_POOL_KEY: Symbol = symbol_short!("PRIZE_P");
 const GAME_STATUS_KEY: Symbol = symbol_short!("G_STATUS");
 const GAME_FINISHED_KEY: Symbol = symbol_short!("G_FIN");
 const WINNER_SET_KEY: Symbol = symbol_short!("W_SET");
+const FACTORY_KEY: Symbol = symbol_short!("FACTORY");
 
 // ── Timelock: 48 hours in seconds ─────────────────────────────────────────────
 const TIMELOCK_PERIOD: u64 = 48 * 60 * 60;
@@ -81,6 +82,7 @@ pub enum ArenaError {
     UpgradeAlreadyPending = 29,
     WinnerAlreadySet = 30,
     WinnerNotSet = 31,
+    ParticipationLimitReached = 32,
 }
 
 // ── Types ─────────────────────────────────────────────────────────────────────
@@ -221,6 +223,7 @@ impl ArenaContract {
         factory.require_auth();
 
         env.storage().instance().set(&ADMIN_KEY, &admin);
+        env.storage().instance().set(&FACTORY_KEY, &factory);
     }
 
     pub fn admin(env: Env) -> Address {
@@ -228,6 +231,13 @@ impl ArenaContract {
             .instance()
             .get(&ADMIN_KEY)
             .expect("not initialized")
+    }
+
+    pub fn factory(env: Env) -> Address {
+        env.storage()
+            .instance()
+            .get(&FACTORY_KEY)
+            .expect("factory not initialized")
     }
 
     pub fn set_admin(env: Env, new_admin: Address) {
@@ -383,6 +393,19 @@ impl ArenaContract {
             .instance()
             .get(&TOKEN_KEY)
             .ok_or(ArenaError::TokenNotSet)?;
+        
+        // Enforce participation limits only when the arena was initialized by the factory.
+        if let Some(factory) = env.storage().instance().get::<_, Address>(&FACTORY_KEY) {
+            let participation_result: Result<u32, soroban_sdk::Error> = env.invoke_contract(
+                &factory,
+                &Symbol::new(&env, "incr_participation"),
+                Vec::from_array(&env, [(&player).into_val(&env)]),
+            );
+            if participation_result.is_err() {
+                return Err(ArenaError::ParticipationLimitReached);
+            }
+        }
+        
         // CEI: effects before interaction
         storage(&env).set(&survivor_key, &());
         bump(&env, &survivor_key);
@@ -784,6 +807,16 @@ impl ArenaContract {
             storage(&env).set(&DataKey::Round, &round);
             bump(&env, &DataKey::Round);
         }
+        
+        // Best-effort decrement of the factory participation counter for factory-created arenas.
+        if let Some(factory) = env.storage().instance().get::<_, Address>(&FACTORY_KEY) {
+            let _decrement_result: Result<(), soroban_sdk::Error> = env.invoke_contract(
+                &factory,
+                &Symbol::new(&env, "decrement_participation"),
+                Vec::from_array(&env, [(&winner).into_val(&env)]),
+            );
+        }
+        
         env.events()
             .publish((TOPIC_CLAIM,), (winner, prize, EVENT_VERSION));
         Ok(prize)

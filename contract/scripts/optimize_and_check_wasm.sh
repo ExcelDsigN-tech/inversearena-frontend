@@ -2,7 +2,7 @@
 set -euo pipefail
 
 MAX_BYTES=102400
-CONTRACTS=(arena factory payout staking)
+CONTRACTS=(arena factory mock_vault payout staking)
 TARGET_DIR="target/wasm32-unknown-unknown/release"
 METRICS_DIR="target/wasm-metrics"
 METRICS_FILE="${METRICS_DIR}/sizes.md"

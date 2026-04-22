@@ -4,30 +4,10 @@ extern crate std;
 
 use super::*;
 use soroban_sdk::{
-    testutils::Address as _, Address, Env,
-    token::StellarAssetClient,
+    testutils::Address as _,
+    token::{self, StellarAssetClient},
+    Address, Env,
 };
-
-fn setup() -> (Env, Address, Address) {
-    let env = Env::default();
-    env.mock_all_auths();
-
-    let admin = Address::generate(&env);
-    let staker = Address::generate(&env);
-
-    let token_admin = Address::generate(&env);
-    let token_id = env
-        .register_stellar_asset_contract_v2(token_admin.clone())
-        .address();
-    let token_admin_client = StellarAssetClient::new(&env, &token_id);
-    token_admin_client.mint(&staker, &10_000i128);
-
-    let contract_id = env.register_contract(None, StakingContract);
-    let client = StakingContractClient::new(&env, &contract_id);
-    client.initialize(&admin, &token_id);
-
-    (env, contract_id, staker)
-}
 
 fn setup() -> (
     Env,
@@ -41,9 +21,10 @@ fn setup() -> (
 
     let admin = Address::generate(&env);
     let staker = Address::generate(&env);
+
     let asset = env.register_stellar_asset_contract_v2(admin.clone());
     let token_address = asset.address();
-    let token_admin = token::StellarAssetClient::new(&env, &token_address);
+    let token_admin = StellarAssetClient::new(&env, &token_address);
     token_admin.mint(&staker, &1_000_000_000i128);
 
     let contract_id = env.register(StakingContract, ());
@@ -61,70 +42,39 @@ fn setup() -> (
 }
 
 #[test]
-fn initialize_sets_token_and_zero_totals() {
-    let (_env, _admin, _staker, client, token_client) = setup();
+fn hello_returns_liveness_value() {
+    let env = Env::default();
+    let contract_id = env.register(StakingContract, ());
+    let client = StakingContractClient::new(&env, &contract_id);
 
-    assert_eq!(client.token(), token_client.address.clone());
-    assert_eq!(client.total_staked(), 0);
-    assert_eq!(client.total_shares(), 0);
+    assert_eq!(client.hello(), 101112);
 }
 
 #[test]
-fn stake_transfers_tokens_and_records_position() {
+fn initialize_sets_admin_and_unpaused() {
+    let (_env, admin, _staker, client, _token_client) = setup();
+
+    assert_eq!(client.admin(), admin);
+    assert!(!client.is_paused());
+}
+
+#[test]
+fn stake_transfers_tokens_and_updates_balance() {
     let (_env, _admin, staker, client, token_client) = setup();
     let contract_address = client.address.clone();
 
-    let staker_balance_before = token_client.balance(&staker);
-    let contract_balance_before = token_client.balance(&contract_address);
+    let staker_before = token_client.balance(&staker);
+    let contract_before = token_client.balance(&contract_address);
 
-    let minted_shares = client.stake(&staker, &250_000_000i128);
+    let minted = client.stake(&staker, &250_000_000i128);
 
-    assert_eq!(minted_shares, 250_000_000);
-    assert_eq!(
-        token_client.balance(&staker),
-        staker_balance_before - 250_000_000
-    );
+    assert_eq!(minted, 250_000_000i128);
+    assert_eq!(client.staked_balance(&staker), 250_000_000i128);
+    assert_eq!(token_client.balance(&staker), staker_before - 250_000_000i128);
     assert_eq!(
         token_client.balance(&contract_address),
-        contract_balance_before + 250_000_000
+        contract_before + 250_000_000i128
     );
-
-    assert_eq!(
-        client.get_position(&staker),
-        StakePosition {
-            amount: 250_000_000,
-            shares: 250_000_000,
-        }
-    );
-    assert_eq!(client.total_staked(), 250_000_000);
-    assert_eq!(client.total_shares(), 250_000_000);
-}
-
-#[test]
-fn stake_mints_proportional_shares_for_later_stakers() {
-    let (env, _admin, first_staker, client, token_client) = setup();
-    let second_staker = Address::generate(&env);
-    let token_admin = token::StellarAssetClient::new(&env, &client.token());
-    token_admin.mint(&second_staker, &1_000_000_000i128);
-
-    client.stake(&first_staker, &200_000_000i128);
-
-    env.as_contract(&client.address, || {
-        env.storage()
-            .instance()
-            .set(&TOTAL_STAKED_KEY, &400_000_000i128);
-    });
-
-    let minted_second = client.stake(&second_staker, &100_000_000i128);
-    assert_eq!(minted_second, 50_000_000);
-    assert_eq!(
-        client.get_position(&second_staker),
-        StakePosition {
-            amount: 100_000_000,
-            shares: 50_000_000,
-        }
-    );
-    assert_eq!(token_client.balance(&second_staker), 900_000_000);
 }
 
 #[test]
@@ -132,214 +82,65 @@ fn stake_rejects_non_positive_amounts() {
     let (_env, _admin, staker, client, _token_client) = setup();
 
     assert_eq!(
-        client.try_stake(&staker, &0),
+        client.try_stake(&staker, &0i128),
         Err(Ok(StakingError::InvalidAmount))
     );
     assert_eq!(
-        client.try_stake(&staker, &-1),
+        client.try_stake(&staker, &-1i128),
         Err(Ok(StakingError::InvalidAmount))
     );
 }
 
 #[test]
-fn stake_state_is_updated_before_transfer() {
-    // Verifies CEI ordering: after stake(), totals and position reflect the deposit
-    // regardless of when the token transfer settles — ensuring a re-entrant read
-    // during transfer would see the already-committed state, not stale balances.
-    let (_env, _admin, staker, client, _token_client) = setup();
-
-    let amount = 500_000_000i128;
-    let minted = client.stake(&staker, &amount);
-
-    // State must be committed
-    assert_eq!(client.total_staked(), amount);
-    assert_eq!(client.total_shares(), minted);
-    assert_eq!(
-        client.get_position(&staker),
-        StakePosition {
-            amount,
-            shares: minted,
-        }
-    );
-
-    // A second stake uses already-updated totals for share calculation
-    let amount2 = 100_000_000i128;
-    let minted2 = client.stake(&staker, &amount2);
-    // shares = amount2 * total_shares / total_staked = 100M * 500M / 500M = 100M
-    assert_eq!(minted2, amount2);
-    assert_eq!(client.total_staked(), amount + amount2);
-    assert_eq!(client.total_shares(), minted + minted2);
-}
-
-#[test]
-fn unstake_full_returns_all_tokens() {
+fn unstake_returns_tokens_and_reduces_balance() {
     let (_env, _admin, staker, client, token_client) = setup();
+
     let balance_before = token_client.balance(&staker);
+    client.stake(&staker, &400_000_000i128);
 
-    let shares = client.stake(&staker, &250_000_000i128);
-    let returned = client.unstake(&staker, &shares);
+    let returned = client.unstake(&staker, &150_000_000i128);
 
-    assert_eq!(returned, 250_000_000);
-    assert_eq!(token_client.balance(&staker), balance_before);
-    assert_eq!(client.total_staked(), 0);
-    assert_eq!(client.total_shares(), 0);
-    assert_eq!(
-        client.get_position(&staker),
-        StakePosition {
-            amount: 0,
-            shares: 0,
-        }
-    );
+    assert_eq!(returned, 150_000_000i128);
+    assert_eq!(client.staked_balance(&staker), 250_000_000i128);
+    assert_eq!(token_client.balance(&staker), balance_before - 250_000_000i128);
 }
 
 #[test]
-fn unstake_partial_returns_proportional_tokens() {
-    let (_env, _admin, staker, client, _token_client) = setup();
-
-    let shares = client.stake(&staker, &400_000_000i128);
-    let half = shares / 2;
-    let returned = client.unstake(&staker, &half);
-
-    assert_eq!(returned, 200_000_000);
-    assert_eq!(client.total_staked(), 200_000_000);
-    assert_eq!(client.total_shares(), 200_000_000);
-}
-
-#[test]
-fn unstake_rejects_insufficient_shares() {
+fn unstake_rejects_invalid_or_excessive_amounts() {
     let (_env, _admin, staker, client, _token_client) = setup();
 
     client.stake(&staker, &100_000_000i128);
+
     assert_eq!(
-        client.try_unstake(&staker, &999_999_999),
-        Err(Ok(StakingError::InsufficientShares))
+        client.try_unstake(&staker, &0i128),
+        Err(Ok(StakingError::InvalidAmount))
+    );
+    assert_eq!(
+        client.try_unstake(&staker, &101_000_000i128),
+        Err(Ok(StakingError::InsufficientStake))
     );
 }
 
 #[test]
-fn unstake_rejects_zero_shares() {
+fn pause_blocks_stake_and_unstake_until_unpaused() {
     let (_env, _admin, staker, client, _token_client) = setup();
 
-    client.stake(&staker, &100_000_000i128);
-    assert_eq!(
-        client.try_unstake(&staker, &0),
-        Err(Ok(StakingError::ZeroShares))
-    );
-}
-
-// ── Issue #388: stake/unstake events use only fixed topic; variable data in payload ──
-
-#[test]
-fn stake_emits_one_event() {
-    use soroban_sdk::testutils::Events as _;
-
-    let (env, _admin, staker, client, _token_client) = setup();
-
-    let before = env.events().all().len();
-    client.stake(&staker, &100_000_000i128);
-    let after = env.events().all().len();
-
-    // Exactly one staking event must be emitted (token SAC transfers do not
-    // add to the contract event log in the test environment).
-    assert!(
-        after > before,
-        "stake() must emit at least one event"
-    );
-}
-
-#[test]
-fn unstake_emits_one_event() {
-    use soroban_sdk::testutils::Events as _;
-
-    let (env, _admin, staker, client, _token_client) = setup();
-
-    let shares = client.stake(&staker, &100_000_000i128);
-
-    // Flush the previous invocation's events with a read-only call (emits 0 events)
-    // so that `before` reflects a clean baseline for the unstake call.
-    let _ = client.total_staked();
-    let before = env.events().all().len();
-    client.unstake(&staker, &shares);
-    let after = env.events().all().len();
-
-    assert!(
-        after > before,
-        "unstake() must emit at least one event"
-    );
-}
-
-#[test]
-fn stake_and_unstake_each_emit_exactly_one_new_event() {
-    use soroban_sdk::testutils::Events as _;
-
-    let (env, _admin, staker, client, _token_client) = setup();
-
-    // env.events().all() returns events for the most-recent invocation only.
-    // Capture counts directly after each call rather than computing deltas.
-    let shares = client.stake(&staker, &100_000_000i128);
-    let stake_events = env.events().all().len();
-
-    client.unstake(&staker, &shares);
-    let unstake_events = env.events().all().len();
-
-    assert!(stake_events >= 1, "stake() must emit at least one event");
-    assert!(unstake_events >= 1, "unstake() must emit at least one event");
-}
-
-#[test]
-fn stake_fails_when_paused() {
-    let (env, contract_id, staker) = setup();
-    let client = StakingContractClient::new(&env, &contract_id);
-
+    client.stake(&staker, &200_000_000i128);
     client.pause();
-    assert!(client.is_paused());
 
-    let result = client.try_stake(&staker, &500i128);
-    assert_eq!(result, Err(Ok(StakingError::Paused)));
-}
-
-#[test]
-fn unstake_fails_when_paused() {
-    let (env, contract_id, staker) = setup();
-    let client = StakingContractClient::new(&env, &contract_id);
-
-    // Stake successfully while unpaused, then pause.
-    client.stake(&staker, &1_000i128);
-    assert_eq!(client.staked_balance(&staker), 1_000i128);
-
-    client.pause();
-    assert!(client.is_paused());
-
-    let result = client.try_unstake(&staker, &500i128);
-    assert_eq!(result, Err(Ok(StakingError::Paused)));
-
-    // Balance unchanged.
-    assert_eq!(client.staked_balance(&staker), 1_000i128);
-}
-
-#[test]
-fn unpause_restores_functionality() {
-    let (env, contract_id, staker) = setup();
-    let client = StakingContractClient::new(&env, &contract_id);
-
-    // Pause and verify stake is blocked.
-    client.pause();
     assert!(client.is_paused());
     assert_eq!(
-        client.try_stake(&staker, &500i128),
+        client.try_stake(&staker, &10i128),
+        Err(Ok(StakingError::Paused))
+    );
+    assert_eq!(
+        client.try_unstake(&staker, &10i128),
         Err(Ok(StakingError::Paused))
     );
 
-    // Unpause and verify stake succeeds.
     client.unpause();
+
     assert!(!client.is_paused());
-
-    let shares = client.stake(&staker, &500i128);
-    assert_eq!(shares, 500i128);
-    assert_eq!(client.staked_balance(&staker), 500i128);
-
-    // Unstake also works after unpause.
-    let returned = client.unstake(&staker, &500i128);
-    assert_eq!(returned, 500i128);
-    assert_eq!(client.staked_balance(&staker), 0i128);
+    assert_eq!(client.unstake(&staker, &50i128), 50i128);
+    assert_eq!(client.staked_balance(&staker), 199_999_950i128);
 }

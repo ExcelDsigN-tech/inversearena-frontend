@@ -284,6 +284,14 @@
                       },
                       {
                         "key": {
+                          "symbol": "PART_LIM"
+                        },
+                        "val": {
+                          "u32": 3
+                        }
+                      },
+                      {
+                        "key": {
                           "symbol": "P_CNT"
                         },
                         "val": {
@@ -647,6 +655,14 @@
                         },
                         "val": {
                           "u32": 10
+                        }
+                      },
+                      {
+                        "key": {
+                          "symbol": "FACTORY"
+                        },
+                        "val": {
+                          "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM"
                         }
                       },
                       {

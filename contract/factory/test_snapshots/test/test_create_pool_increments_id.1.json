@@ -441,6 +441,14 @@
                       },
                       {
                         "key": {
+                          "symbol": "PART_LIM"
+                        },
+                        "val": {
+                          "u32": 3
+                        }
+                      },
+                      {
+                        "key": {
                           "symbol": "P_CNT"
                         },
                         "val": {
@@ -841,6 +849,14 @@
                       },
                       {
                         "key": {
+                          "symbol": "FACTORY"
+                        },
+                        "val": {
+                          "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM"
+                        }
+                      },
+                      {
+                        "key": {
                           "symbol": "TOKEN"
                         },
                         "val": {
@@ -1049,6 +1065,14 @@
                         },
                         "val": {
                           "u32": 8
+                        }
+                      },
+                      {
+                        "key": {
+                          "symbol": "FACTORY"
+                        },
+                        "val": {
+                          "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM"
                         }
                       },
                       {

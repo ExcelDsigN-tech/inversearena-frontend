@@ -18,6 +18,8 @@ const MIN_STAKE_KEY: Symbol = symbol_short!("MIN_STK");
 const ARENA_WASM_HASH_KEY: Symbol = symbol_short!("AR_WASM");
 const POOL_COUNT_KEY: Symbol = symbol_short!("P_CNT");
 const SCHEMA_VERSION_KEY: Symbol = symbol_short!("S_VER");
+const PARTICIPATION_LIMIT_KEY: Symbol = symbol_short!("PART_LIM");
+const ACTIVE_PARTICIPATIONS_PREFIX: Symbol = symbol_short!("ACT_PART");
 
 /// Current schema version. Bump this when storage layout changes.
 const CURRENT_SCHEMA_VERSION: u32 = 1;
@@ -51,6 +53,10 @@ const TIMELOCK_PERIOD: u64 = 48 * 60 * 60;
 
 const DEFAULT_MIN_STAKE: i128 = 10_000_000;
 
+// ── Default player participation limit ────────────────────────────────────────
+
+const DEFAULT_PARTICIPATION_LIMIT: u32 = 3;
+
 // ── Event topics ──────────────────────────────────────────────────────────────
 
 const TOPIC_UPGRADE_PROPOSED: Symbol = symbol_short!("UP_PROP");
@@ -64,6 +70,9 @@ const TOPIC_WASM_UPDATED: Symbol = symbol_short!("WASM_UP");
 const TOPIC_TOKEN_ADDED: Symbol = symbol_short!("TOK_ADD");
 const TOPIC_TOKEN_REMOVED: Symbol = symbol_short!("TOK_REM");
 const TOPIC_MIN_STAKE_UPDATED: Symbol = symbol_short!("MIN_UP");
+const TOPIC_PARTICIPATION_INCREMENTED: Symbol = symbol_short!("PART_INC");
+const TOPIC_PARTICIPATION_DECREMENTED: Symbol = symbol_short!("PART_DEC");
+const TOPIC_PARTICIPATION_LIMIT_UPDATED: Symbol = symbol_short!("PART_UP");
 
 /// Event payload version. Include in every event data tuple so consumers
 /// can detect schema changes without re-deploying indexers.
@@ -107,6 +116,8 @@ pub enum Error {
     UnsupportedToken = 13,
     /// `propose_upgrade` called while a pending upgrade proposal already exists.
     UpgradeAlreadyPending = 14,
+    /// Player has reached the maximum concurrent arena participations limit.
+    ParticipationLimitExceeded = 15,
 }
 
 // ── Contract ──────────────────────────────────────────────────────────────────
@@ -139,6 +150,9 @@ impl FactoryContract {
         env.storage()
             .instance()
             .set(&MIN_STAKE_KEY, &DEFAULT_MIN_STAKE);
+        env.storage()
+            .instance()
+            .set(&PARTICIPATION_LIMIT_KEY, &DEFAULT_PARTICIPATION_LIMIT);
         env.storage()
             .instance()
             .set(&SCHEMA_VERSION_KEY, &CURRENT_SCHEMA_VERSION);
@@ -298,6 +312,102 @@ impl FactoryContract {
             .instance()
             .get(&MIN_STAKE_KEY)
             .unwrap_or(DEFAULT_MIN_STAKE)
+    }
+
+    /// Set the maximum number of concurrent arenas a player can participate in. Admin-only.
+    ///
+    /// # Errors
+    /// * [`Error::NotInitialized`] — contract not initialised.
+    /// * [`Error::InvalidStakeAmount`] — `new_limit` is zero.
+    pub fn set_participation_limit(env: Env, new_limit: u32) -> Result<(), Error> {
+        let admin = require_admin(&env)?;
+        admin.require_auth();
+        if new_limit == 0 {
+            return Err(Error::InvalidStakeAmount);
+        }
+        let previous_limit = Self::get_participation_limit(env.clone());
+        env.storage()
+            .instance()
+            .set(&PARTICIPATION_LIMIT_KEY, &new_limit);
+        env.events().publish(
+            (TOPIC_PARTICIPATION_LIMIT_UPDATED,),
+            (EVENT_VERSION, previous_limit, new_limit),
+        );
+        Ok(())
+    }
+
+    /// Get the maximum number of concurrent arenas a player can participate in.
+    pub fn get_participation_limit(env: Env) -> u32 {
+        env.storage()
+            .instance()
+            .get(&PARTICIPATION_LIMIT_KEY)
+            .unwrap_or(DEFAULT_PARTICIPATION_LIMIT)
+    }
+
+    /// Check and increment the participation counter for a player.
+    ///
+    /// Called by arena's `join()` function to enforce per-address participation limits.
+    /// Returns the new count if successful, or `ParticipationLimitExceeded` if at the limit.
+    ///
+    /// # Errors
+    /// * [`Error::ParticipationLimitExceeded`] — player has reached max concurrent arenas.
+    ///
+    /// # Authorization
+    /// Must be called by an arena contract (cross-contract invocation, not enforced here).
+    pub fn incr_participation(
+        env: Env,
+        player: Address,
+    ) -> Result<u32, Error> {
+        require_admin(&env)?; // Ensure contract is initialized
+        
+        let limit = Self::get_participation_limit(env.clone());
+        let key = (ACTIVE_PARTICIPATIONS_PREFIX, player.clone());
+        let current_count: u32 = env.storage().instance().get(&key).unwrap_or(0u32);
+        
+        if current_count >= limit {
+            return Err(Error::ParticipationLimitExceeded);
+        }
+        
+        let new_count = current_count + 1;
+        env.storage().instance().set(&key, &new_count);
+        env.events().publish(
+            (TOPIC_PARTICIPATION_INCREMENTED,),
+            (EVENT_VERSION, player, new_count),
+        );
+        Ok(new_count)
+    }
+
+    /// Decrement the participation counter for a player.
+    ///
+    /// Called by arena's `claim()` function after game completion.
+    /// Safe to call multiple times (idempotent: won't go below 0).
+    ///
+    /// # Authorization
+    /// Must be called by an arena contract (cross-contract invocation, not enforced here).
+    pub fn decrement_participation(env: Env, player: Address) -> Result<(), Error> {
+        require_admin(&env)?; // Ensure contract is initialized
+        
+        let key = (ACTIVE_PARTICIPATIONS_PREFIX, player.clone());
+        let current_count: u32 = env.storage().instance().get(&key).unwrap_or(0u32);
+        
+        let new_count = if current_count > 0 {
+            current_count - 1
+        } else {
+            0
+        };
+        
+        env.storage().instance().set(&key, &new_count);
+        env.events().publish(
+            (TOPIC_PARTICIPATION_DECREMENTED,),
+            (EVENT_VERSION, player, new_count),
+        );
+        Ok(())
+    }
+
+    /// Get the current participation count for a player.
+    pub fn get_participation_count(env: Env, player: Address) -> u32 {
+        let key = (ACTIVE_PARTICIPATIONS_PREFIX, player);
+        env.storage().instance().get(&key).unwrap_or(0u32)
     }
 
     /// Create a new pool (arena). Only admin or whitelisted hosts can call this.
