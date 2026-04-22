@@ -20,6 +20,7 @@ const POOL_COUNT_KEY: Symbol = symbol_short!("P_CNT");
 const SCHEMA_VERSION_KEY: Symbol = symbol_short!("S_VER");
 const PARTICIPATION_LIMIT_KEY: Symbol = symbol_short!("PART_LIM");
 const ACTIVE_PARTICIPATIONS_PREFIX: Symbol = symbol_short!("ACT_PART");
+const PAUSED_KEY: Symbol = symbol_short!("PAUSED");
 
 /// Current schema version. Bump this when storage layout changes.
 const CURRENT_SCHEMA_VERSION: u32 = 1;
@@ -86,6 +87,8 @@ const TOPIC_PARTICIPATION_INCREMENTED: Symbol = symbol_short!("PART_INC");
 const TOPIC_PARTICIPATION_DECREMENTED: Symbol = symbol_short!("PART_DEC");
 const TOPIC_PARTICIPATION_LIMIT_UPDATED: Symbol = symbol_short!("PART_UP");
 const TOPIC_PLAYER_STATS_UPDATED: Symbol = symbol_short!("P_STAT");
+const TOPIC_PAUSED: Symbol = symbol_short!("PAUSED");
+const TOPIC_UNPAUSED: Symbol = symbol_short!("UNPAUSED");
 
 /// Event payload version. Include in every event data tuple so consumers
 /// can detect schema changes without re-deploying indexers.
@@ -129,10 +132,12 @@ pub enum Error {
     UnsupportedToken = 13,
     /// `propose_upgrade` called while a pending upgrade proposal already exists.
     UpgradeAlreadyPending = 14,
+    /// Contract is paused; write operations are disabled.
+    Paused = 15,
     /// Player has reached the maximum concurrent arena participations limit.
-    ParticipationLimitExceeded = 15,
+    ParticipationLimitExceeded = 16,
     /// Invalid input for arena status update callback.
-    InvalidStatusInput = 16,
+    InvalidStatusInput = 17,
 }
 
 // ── Contract ──────────────────────────────────────────────────────────────────
@@ -308,6 +313,7 @@ impl FactoryContract {
     /// * [`Error::InvalidStakeAmount`] — `min_stake` is zero or negative.
     pub fn set_min_stake(env: Env, min_stake: i128) -> Result<(), Error> {
         let admin = require_admin(&env)?;
+        require_not_paused(&env)?;
         admin.require_auth();
         if min_stake <= 0 {
             return Err(Error::InvalidStakeAmount);
@@ -505,6 +511,7 @@ impl FactoryContract {
         capacity: u32,
     ) -> Result<Address, Error> {
         let admin = require_admin(&env)?;
+        require_not_paused(&env)?;
 
         // Prevent spoofing: the `caller` address used as `creator` must be
         // the transaction signer (unless Soroban auth is mocked in tests).
@@ -649,6 +656,7 @@ impl FactoryContract {
     /// Add a token to the supported currency list. Admin-only.
     pub fn add_supported_token(env: Env, token: Address) -> Result<(), Error> {
         let admin = require_admin(&env)?;
+        require_not_paused(&env)?;
         admin.require_auth();
         env.storage()
             .instance()
@@ -664,6 +672,7 @@ impl FactoryContract {
     /// Emits `TokenRemoved(token)`.
     pub fn remove_supported_token(env: Env, token: Address) -> Result<(), Error> {
         let admin = require_admin(&env)?;
+        require_not_paused(&env)?;
         admin.require_auth();
         env.storage()
             .instance()
@@ -846,6 +855,34 @@ impl FactoryContract {
         }
         results
     }
+
+    // ── Emergency pause ──────────────────────────────────────────────────────
+
+    /// Pause the contract, disabling all write operations. Admin-only.
+    pub fn pause(env: Env) -> Result<(), Error> {
+        let admin = require_admin(&env)?;
+        admin.require_auth();
+        env.storage().instance().set(&PAUSED_KEY, &true);
+        env.events().publish((TOPIC_PAUSED,), (EVENT_VERSION,));
+        Ok(())
+    }
+
+    /// Unpause the contract, re-enabling write operations. Admin-only.
+    pub fn unpause(env: Env) -> Result<(), Error> {
+        let admin = require_admin(&env)?;
+        admin.require_auth();
+        env.storage().instance().remove(&PAUSED_KEY);
+        env.events().publish((TOPIC_UNPAUSED,), (EVENT_VERSION,));
+        Ok(())
+    }
+
+    /// Return whether the contract is currently paused.
+    pub fn is_paused(env: Env) -> bool {
+        env.storage()
+            .instance()
+            .get(&PAUSED_KEY)
+            .unwrap_or(false)
+    }
 }
 
 // ── Private helpers ───────────────────────────────────────────────────────────
@@ -888,6 +925,19 @@ fn write_player_stats(env: &Env, player: Address, stats: &PlayerStats) {
     env.storage()
         .persistent()
         .set(&DataKey::PlayerStats(player), stats);
+}
+
+/// Return `Error::Paused` if the contract is currently paused.
+fn require_not_paused(env: &Env) -> Result<(), Error> {
+    if env
+        .storage()
+        .instance()
+        .get(&PAUSED_KEY)
+        .unwrap_or(false)
+    {
+        return Err(Error::Paused);
+    }
+    Ok(())
 }
 
 #[cfg(test)]
