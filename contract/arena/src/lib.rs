@@ -33,6 +33,21 @@ const TOPIC_ROUND_RESOLVED: Symbol = symbol_short!("RSLVD");
 const TOPIC_YIELD_DISTRIBUTED: Symbol = symbol_short!("Y_DIST");
 const TOPIC_PAUSED: Symbol = symbol_short!("PAUSED");
 const TOPIC_UNPAUSED: Symbol = symbol_short!("UNPAUSED");
+const TOPIC_LEAVE: Symbol = symbol_short!("LEAVE");
+const TOPIC_CANCELLED: Symbol = symbol_short!("CANCELLED");
+const TOPIC_MAX_ROUNDS: Symbol = symbol_short!("MX_ROUND");
+const TOPIC_STATE_CHANGED: Symbol = symbol_short!("ST_CHG");
+const TOPIC_PLAYER_JOINED: Symbol = symbol_short!("P_JOIN");
+const TOPIC_CHOICE_SUBMITTED: Symbol = symbol_short!("CH_SUB");
+const TOPIC_ROUND_RESOLVED: Symbol = symbol_short!("RSLVD");
+const TOPIC_PLAYER_ELIMINATED: Symbol = symbol_short!("P_ELIM");
+const TOPIC_WINNER_DECLARED: Symbol = symbol_short!("W_DECL");
+const TOPIC_ARENA_CANCELLED: Symbol = symbol_short!("A_CANC");
+const TOPIC_ARENA_EXPIRED: Symbol = symbol_short!("A_EXP");
+
+const EVENT_VERSION: u32 = 1;
+
+// ── Error codes ───────────────────────────────────────────────────────────────
 
 #[contracterror]
 #[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
@@ -79,6 +94,9 @@ pub enum ArenaError {
     RevealDeadlinePassed = 39,
     CommitDeadlinePassed = 40,
     AlreadyCommitted = 41,
+    DeadlineTooSoon = 42,
+    DeadlineTooFar = 43,
+    DeadlineNotReached = 44,
 }
 
 #[contracttype]
@@ -95,6 +113,7 @@ pub struct ArenaConfig {
     pub required_stake_amount: i128,
     pub max_rounds: u32,
     pub winner_yield_share_bps: u32,
+    pub join_deadline: u64,
 }
 
 #[contracttype]
@@ -163,6 +182,108 @@ pub struct YieldDistributed {
     pub winner_yield: i128,
     pub eliminated_yield: i128,
     pub eliminated_count: u32,
+pub struct PlayerJoined {
+    pub arena_id: u64,
+    pub player: Address,
+    pub entry_fee: i128,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ChoiceSubmitted {
+    pub arena_id: u64,
+    pub round: u32,
+    pub player: Address,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RoundResolved {
+    pub arena_id: u64,
+    pub round: u32,
+    pub heads_count: u32,
+    pub tails_count: u32,
+    pub eliminated: Vec<Address>,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PlayerEliminated {
+    pub arena_id: u64,
+    pub round: u32,
+    pub player: Address,
+    pub choice_made: Choice,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WinnerDeclared {
+    pub arena_id: u64,
+    pub winner: Address,
+    pub prize_pool: i128,
+    pub yield_earned: i128,
+    pub total_rounds: u32,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ArenaCancelled {
+    pub arena_id: u64,
+    pub reason: String,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ArenaExpired {
+    pub arena_id: u64,
+    pub refunded_players: u32,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ArenaSnapshot {
+    pub arena_id: u64,
+    pub state: ArenaState,
+    pub current_round: u32,
+    pub round_deadline: u64,
+    pub total_players: u32,
+    pub survivors: Vec<Address>,
+    pub eliminated: Vec<Address>,
+    pub prize_pool: i128,
+    pub yield_earned: i128,
+    pub winner: Option<Address>,
+    pub config: ArenaConfig,
+}
+
+macro_rules! assert_state {
+    ($current:expr, $expected:pat) => {
+        match $current {
+            $expected => {},
+            _ => panic!("Invalid state transition: current state {:?} is not allowed for this operation", $current),
+        }
+    };
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FullStateView {
+    pub survivors_count: u32,
+    pub max_capacity: u32,
+    pub round_number: u32,
+    pub current_stake: i128,
+    pub potential_payout: i128,
+    pub is_active: bool,
+    pub has_won: bool,
+}
+
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct ArenaMetadata {
+    pub arena_id: u64,
+    pub name: String,
+    pub description: Option<String>,
+    pub host: Address,
+    pub created_at: u64,
 }
 
 #[contracttype]
@@ -226,10 +347,20 @@ impl ArenaContract {
         env: Env,
         round_speed_in_ledgers: u32,
         required_stake_amount: i128,
+        join_deadline: u64,
     ) -> Result<(), ArenaError> {
         if env.storage().instance().has(&DataKey::Config) {
             return Err(ArenaError::AlreadyInitialized);
         }
+
+        let now = env.ledger().timestamp();
+        if join_deadline < now + 3600 {
+            return Err(ArenaError::DeadlineTooSoon);
+        }
+        if join_deadline > now + 604800 {
+            return Err(ArenaError::DeadlineTooFar);
+        }
+
         if round_speed_in_ledgers == 0 || round_speed_in_ledgers > bounds::MAX_SPEED_LEDGERS {
             return Err(ArenaError::InvalidRoundSpeed);
         }
@@ -244,6 +375,17 @@ impl ArenaContract {
             winner_yield_share_bps: DEFAULT_WINNER_YIELD_SHARE_BPS,
         };
         env.storage().instance().set(&DataKey::Config, &config);
+        env.storage().instance().extend_ttl(GAME_TTL_THRESHOLD, GAME_TTL_EXTEND_TO);
+        env.storage().instance().set(
+            &DataKey::Config,
+            &ArenaConfig {
+                round_speed_in_ledgers,
+                round_duration_seconds: 0,
+                required_stake_amount,
+                max_rounds: bounds::DEFAULT_MAX_ROUNDS,
+                join_deadline,
+            },
+        );
         env.storage().instance().set(
             &DataKey::Round,
             &RoundState {
@@ -351,6 +493,161 @@ impl ArenaContract {
         env.storage()
             .persistent()
             .set(&DataKey::AllPlayers, &players);
+        
+        env.events().publish(
+            (TOPIC_PLAYER_JOINED, arena_id),
+            PlayerJoined {
+                arena_id,
+                player: player.clone(),
+                entry_fee: amount,
+            },
+        );
+        Ok(())
+    }
+
+    pub fn cancel_arena(env: Env) -> Result<(), ArenaError> {
+        require_not_paused(&env)?;
+        let admin = Self::admin(env.clone());
+        admin.require_auth();
+
+        if env.storage().instance().get::<_, bool>(&CANCELLED_KEY).unwrap_or(false) {
+            return Err(ArenaError::AlreadyCancelled);
+        }
+        if env.storage().instance().get::<_, bool>(&GAME_FINISHED_KEY).unwrap_or(false) {
+            return Err(ArenaError::GameAlreadyFinished);
+        }
+
+        let all_players: Vec<Address> = env.storage().persistent().get(&DataKey::AllPlayers).unwrap_or(Vec::new(&env));
+        if !all_players.is_empty() {
+            let config = get_config(&env)?;
+            let token: Address = env.storage().instance().get(&TOKEN_KEY).ok_or(ArenaError::TokenNotSet)?;
+            let refund_amount = config.required_stake_amount;
+            let token_client = token::Client::new(&env, &token);
+
+            for player in all_players.iter() {
+                if env.storage().persistent().has(&DataKey::Survivor(player.clone()))
+                    && !env.storage().persistent().has(&DataKey::Refunded(player.clone()))
+                {
+                    env.storage().persistent().set(&DataKey::Refunded(player.clone()), &());
+                    bump(&env, &DataKey::Refunded(player.clone()));
+                    token_client.transfer(&env.current_contract_address(), &player, &refund_amount);
+                }
+            }
+            env.storage().instance().set(&PRIZE_POOL_KEY, &0i128);
+        }
+
+        env.storage().instance().set(&CANCELLED_KEY, &true);
+        env.storage().instance().set(&GAME_FINISHED_KEY, &true);
+        set_state(&env, ArenaState::Cancelled);
+        env.events().publish((TOPIC_CANCELLED,), (EVENT_VERSION,));
+
+        Ok(())
+    }
+
+    /// Expire an unfilled arena past its join deadline. Callable by anyone.
+    pub fn expire_arena(env: Env) -> Result<(), ArenaError> {
+        let current_state = get_state(&env);
+        assert_state!(current_state, ArenaState::Pending);
+
+        let config = get_config(&env)?;
+        if env.ledger().timestamp() <= config.join_deadline {
+            return Err(ArenaError::DeadlineNotReached);
+        }
+
+        let all_players: Vec<Address> = env.storage().persistent().get(&DataKey::AllPlayers).unwrap_or(Vec::new(&env));
+        let mut refunded_count: u32 = 0;
+        if !all_players.is_empty() {
+            let token: Address = env.storage().instance().get(&TOKEN_KEY).ok_or(ArenaError::TokenNotSet)?;
+            let refund_amount = config.required_stake_amount;
+            let token_client = token::Client::new(&env, &token);
+
+            for player in all_players.iter() {
+                if env.storage().persistent().has(&DataKey::Survivor(player.clone()))
+                    && !env.storage().persistent().has(&DataKey::Refunded(player.clone()))
+                {
+                    env.storage().persistent().set(&DataKey::Refunded(player.clone()), &());
+                    bump(&env, &DataKey::Refunded(player.clone()));
+                    token_client.transfer(&env.current_contract_address(), &player, &refund_amount);
+                    refunded_count += 1;
+                }
+            }
+            env.storage().instance().set(&PRIZE_POOL_KEY, &0i128);
+        }
+
+        env.storage().instance().set(&CANCELLED_KEY, &true);
+        env.storage().instance().set(&GAME_FINISHED_KEY, &true);
+        set_state(&env, ArenaState::Cancelled);
+
+        env.events().publish(
+            (TOPIC_ARENA_EXPIRED,),
+            ArenaExpired {
+                arena_id: 0,
+                refunded_players: refunded_count,
+            },
+        );
+
+        Ok(())
+    }
+
+    /// Return the join deadline timestamp stored in the config.
+    pub fn get_join_deadline(env: Env) -> u64 {
+        let config: ArenaConfig = env
+            .storage()
+            .instance()
+            .get(&DataKey::Config)
+            .expect("not initialized");
+        config.join_deadline
+    }
+
+    pub fn set_max_rounds(env: Env, max_rounds: u32) -> Result<(), ArenaError> {
+        let admin = Self::admin(env.clone());
+        admin.require_auth();
+
+        if max_rounds < bounds::MIN_MAX_ROUNDS || max_rounds > bounds::MAX_MAX_ROUNDS {
+            return Err(ArenaError::InvalidMaxRounds);
+        }
+
+        let mut config = get_config(&env)?;
+        config.max_rounds = max_rounds;
+        env.storage().instance().set(&DataKey::Config, &config);
+        Ok(())
+    }
+
+    pub fn is_cancelled(env: Env) -> bool {
+        env.storage().instance().get::<_, bool>(&CANCELLED_KEY).unwrap_or(false)
+    }
+
+    pub fn leave(env: Env, player: Address) -> Result<i128, ArenaError> {
+        player.require_auth();
+        require_not_paused(&env)?;
+        let current_state = get_state(&env);
+        assert_state!(current_state, ArenaState::Pending);
+
+        let round = get_round(&env)?;
+        if round.round_number != 0 {
+            return Err(ArenaError::RoundAlreadyActive);
+        }
+
+        let survivor_key = DataKey::Survivor(player.clone());
+        if !env.storage().persistent().has(&survivor_key) {
+            return Err(ArenaError::NotASurvivor);
+        }
+
+        let config = get_config(&env)?;
+        let refund = config.required_stake_amount;
+        let token: Address = env.storage().instance().get(&TOKEN_KEY).ok_or(ArenaError::TokenNotSet)?;
+
+        env.storage().persistent().remove(&survivor_key);
+        let count: u32 = env.storage().instance().get(&SURVIVOR_COUNT_KEY).unwrap_or(0);
+        env.storage().instance().set(&SURVIVOR_COUNT_KEY, &count.saturating_sub(1));
+            
+        let mut all_players: Vec<Address> = env.storage().persistent().get(&DataKey::AllPlayers).unwrap_or(Vec::new(&env));
+        if let Some(i) = all_players.first_index_of(&player) {
+            all_players.remove(i);
+        }
+        env.storage().persistent().set(&DataKey::AllPlayers, &all_players);
+        bump(&env, &DataKey::AllPlayers);
+
         let pool: i128 = env.storage().instance().get(&PRIZE_POOL_KEY).unwrap_or(0);
         env.storage()
             .instance()
@@ -1054,3 +1351,22 @@ mod yield_share_tests {
         assert_eq!(client.claim(&eliminated), 25);
     }
 }
+
+#[cfg(test)]
+mod abi_guard;
+// #[cfg(test)]
+// mod auto_advance_tests;
+// #[cfg(all(test, feature = "integration-tests"))]
+// mod integration_tests;
+// #[cfg(test)]
+// mod metadata_tests;
+// #[cfg(test)]
+// mod state_machine_tests;
+// #[cfg(test)]
+// mod submit_choice_tests;
+#[cfg(test)]
+mod commit_reveal_tests;
+#[cfg(test)]
+mod expire_arena_tests;
+// #[cfg(test)]
+// mod test;
