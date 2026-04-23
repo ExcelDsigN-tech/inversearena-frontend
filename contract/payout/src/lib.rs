@@ -75,6 +75,10 @@ pub struct SplitPayoutReceipt {
     pub winner: Address,
     pub amount: i128,
     pub currency: Address,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PayoutReceipt {
     pub arena_id: u64,
     pub winner: Address,

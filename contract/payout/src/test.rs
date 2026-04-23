@@ -316,7 +316,7 @@ fn test_distribute_prize_invalid_amount_returns_error() {
 
 #[test]
 fn test_distribute_split_payout_two_winners_equal_split() {
-    let (env, _admin, client, token_id, _treasury) = setup_with_token();
+    let (env, _admin, client, token_id, _treasury, _, _) = setup_with_token();
     let winner1 = Address::generate(&env);
     let winner2 = Address::generate(&env);
     let mut winners = Vec::new(&env);
@@ -342,7 +342,7 @@ fn test_distribute_split_payout_two_winners_equal_split() {
 
 #[test]
 fn test_distribute_split_payout_three_winners_remainder_to_first() {
-    let (env, _admin, client, token_id, _treasury) = setup_with_token();
+    let (env, _admin, client, token_id, _treasury, _, _) = setup_with_token();
     let winner1 = Address::generate(&env);
     let winner2 = Address::generate(&env);
     let winner3 = Address::generate(&env);
@@ -361,7 +361,7 @@ fn test_distribute_split_payout_three_winners_remainder_to_first() {
 
 #[test]
 fn test_distribute_split_payout_no_winners_returns_error() {
-    let (env, _admin, client, token_id, _treasury) = setup_with_token();
+    let (env, _admin, client, token_id, _treasury, _, _) = setup_with_token();
     let empty: Vec<Address> = Vec::new(&env);
 
     let result = client.try_distribute_split_payout(&79u32, &empty, &1000i128, &token_id);
@@ -370,7 +370,7 @@ fn test_distribute_split_payout_no_winners_returns_error() {
 
 #[test]
 fn test_distribute_split_payout_single_winner_gets_full_amount() {
-    let (env, _admin, client, token_id, _treasury) = setup_with_token();
+    let (env, _admin, client, token_id, _treasury, _, _) = setup_with_token();
     let winner = Address::generate(&env);
     let mut winners = Vec::new(&env);
     winners.push_back(winner.clone());

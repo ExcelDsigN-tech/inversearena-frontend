@@ -2005,18 +2005,18 @@ fn round_state_machine_invariant_suite_happy_path() {
     let (env, _admin, client, _token_id, _players) = setup_game(5, 2);
     set_ledger_sequence(&env, 100);
     let r0 = client.get_round();
-    invariants::check_round_flags(&r0).unwrap();
+    crate::invariants::check_round_flags(&r0).unwrap();
 
     let r1 = client.start_round();
-    invariants::check_round_flags(&r1).unwrap();
-    invariants::check_round_number_monotonic(r0.round_number, r1.round_number).unwrap();
-    invariants::check_submission_count_monotonic(r0.total_submissions, r1.total_submissions)
+    crate::invariants::check_round_flags(&r1).unwrap();
+    crate::invariants::check_round_number_monotonic(r0.round_number, r1.round_number).unwrap();
+    crate::invariants::check_submission_count_monotonic(r0.total_submissions, r1.total_submissions)
         .unwrap();
 
     set_ledger_sequence(&env, 106);
     let r1t = client.timeout_round();
-    invariants::check_round_flags(&r1t).unwrap();
-    invariants::check_timeout_transition(&r1, &r1t).unwrap();
+    crate::invariants::check_round_flags(&r1t).unwrap();
+    crate::invariants::check_timeout_transition(&r1, &r1t).unwrap();
 }
 
 // ── Issue #319: claim prize-pool drain and round.finished ─────────────────────

@@ -512,8 +512,8 @@ fn timelock_non_admin_propose_panics() {
     let env = Env::default();
     let admin = Address::generate(&env);
     let token_id = Address::generate(&env);
-    let contract_id = env.register(StakingContract, (&admin, &token_id));
     env.mock_all_auths();
+    let contract_id = env.register(StakingContract, (&admin, &token_id));
     let c = StakingContractClient::new(&env, &contract_id);
     // Explicitly clear all mocks so admin.require_auth() is no longer satisfied.
     env.mock_auths(&[]);
@@ -527,8 +527,8 @@ fn timelock_non_admin_execute_panics() {
     let env = Env::default();
     let admin = Address::generate(&env);
     let token_id = Address::generate(&env);
-    let contract_id = env.register(StakingContract, (&admin, &token_id));
     env.mock_all_auths();
+    let contract_id = env.register(StakingContract, (&admin, &token_id));
     let c = StakingContractClient::new(&env, &contract_id);
     // Explicitly clear all mocks so admin.require_auth() is no longer satisfied.
     env.mock_auths(&[]);
