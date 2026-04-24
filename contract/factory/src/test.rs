@@ -10,7 +10,8 @@ use soroban_sdk::{
 
 const TIMELOCK: u64 = 48 * 60 * 60; // 48 hours
 const MIN_STAKE: i128 = 10_000_000; // 10 XLM in stroops
-const MAX_CAPACITY: u32 = 256;
+// Default protocol-wide player cap (see issue #495). Mirrors `MAX_PLAYERS_HARD_CAP`.
+const MAX_CAPACITY: u32 = MAX_PLAYERS_HARD_CAP;
 
 // ── helpers ───────────────────────────────────────────────────────────────────
 
@@ -329,12 +330,136 @@ fn test_create_pool_with_zero_capacity_returns_invalid_capacity() {
 }
 
 #[test]
-fn test_create_pool_exceeding_max_capacity_returns_invalid_capacity() {
+fn test_create_pool_exceeding_max_capacity_returns_exceeds_player_cap() {
     let (env, admin, client) = setup();
     client.set_arena_wasm_hash(&dummy_hash(&env));
     let currency = supported_currency(&env, &client);
     let result = client.try_create_pool(&admin, &MIN_STAKE, &currency, &10u32, &(MAX_CAPACITY + 1), &(env.ledger().timestamp() + 7200));
+    assert_eq!(result, Err(Ok(Error::ExceedsPlayerCap)));
+}
+
+#[test]
+fn test_create_pool_above_structural_capacity_returns_invalid_capacity() {
+    // Even after the admin raises the player cap to its absolute max,
+    // capacity above the structural ceiling (`MAX_POOL_CAPACITY`, currently 256)
+    // must still fail with `InvalidCapacity`.
+    let (env, admin, client) = setup();
+    client.set_arena_wasm_hash(&dummy_hash(&env));
+    let currency = supported_currency(&env, &client);
+    client.set_max_players_cap(&MAX_PLAYERS_ABSOLUTE_CAP);
+    let result = client.try_create_pool(
+        &admin,
+        &MIN_STAKE,
+        &currency,
+        &10u32,
+        &257u32,
+        &(env.ledger().timestamp() + 7200),
+    );
     assert_eq!(result, Err(Ok(Error::InvalidCapacity)));
+}
+
+// ── max_players_cap (issue #495) ──────────────────────────────────────────────
+
+#[test]
+fn test_default_max_players_cap_is_hard_cap() {
+    let (_env, _admin, client) = setup();
+    assert_eq!(client.max_players_cap(), MAX_PLAYERS_HARD_CAP);
+}
+
+#[test]
+fn test_create_pool_at_player_cap_succeeds() {
+    let (env, admin, client) = setup();
+    client.set_arena_wasm_hash(&dummy_hash(&env));
+    let currency = supported_currency(&env, &client);
+    client.create_pool(
+        &admin,
+        &MIN_STAKE,
+        &currency,
+        &10u32,
+        &MAX_PLAYERS_HARD_CAP,
+        &(env.ledger().timestamp() + 7200),
+    );
+}
+
+#[test]
+fn test_create_pool_one_over_player_cap_returns_exceeds_player_cap() {
+    let (env, admin, client) = setup();
+    client.set_arena_wasm_hash(&dummy_hash(&env));
+    let currency = supported_currency(&env, &client);
+    let result = client.try_create_pool(
+        &admin,
+        &MIN_STAKE,
+        &currency,
+        &10u32,
+        &(MAX_PLAYERS_HARD_CAP + 1),
+        &(env.ledger().timestamp() + 7200),
+    );
+    assert_eq!(result, Err(Ok(Error::ExceedsPlayerCap)));
+}
+
+#[test]
+fn test_admin_can_raise_player_cap_then_create_pool_succeeds() {
+    let (env, admin, client) = setup();
+    client.set_arena_wasm_hash(&dummy_hash(&env));
+    let currency = supported_currency(&env, &client);
+
+    // Capacity above the default cap is rejected.
+    let new_capacity = MAX_PLAYERS_HARD_CAP + 1;
+    let pre = client.try_create_pool(
+        &admin,
+        &MIN_STAKE,
+        &currency,
+        &10u32,
+        &new_capacity,
+        &(env.ledger().timestamp() + 7200),
+    );
+    assert_eq!(pre, Err(Ok(Error::ExceedsPlayerCap)));
+
+    // Admin raises the cap; the same call now succeeds.
+    client.set_max_players_cap(&MAX_PLAYERS_ABSOLUTE_CAP);
+    assert_eq!(client.max_players_cap(), MAX_PLAYERS_ABSOLUTE_CAP);
+    client.create_pool(
+        &admin,
+        &MIN_STAKE,
+        &currency,
+        &10u32,
+        &new_capacity,
+        &(env.ledger().timestamp() + 7200),
+    );
+}
+
+#[test]
+fn test_set_max_players_cap_above_absolute_cap_is_rejected() {
+    let (_env, _admin, client) = setup();
+    let result = client.try_set_max_players_cap(&(MAX_PLAYERS_ABSOLUTE_CAP + 1));
+    assert_eq!(result, Err(Ok(Error::InvalidPlayerCap)));
+}
+
+#[test]
+fn test_set_max_players_cap_below_minimum_is_rejected() {
+    let (_env, _admin, client) = setup();
+    let result = client.try_set_max_players_cap(&1u32);
+    assert_eq!(result, Err(Ok(Error::InvalidPlayerCap)));
+}
+
+#[test]
+fn test_set_max_players_cap_can_lower_below_default() {
+    let (env, admin, client) = setup();
+    client.set_arena_wasm_hash(&dummy_hash(&env));
+    let currency = supported_currency(&env, &client);
+
+    client.set_max_players_cap(&8u32);
+    assert_eq!(client.max_players_cap(), 8u32);
+
+    let result = client.try_create_pool(
+        &admin,
+        &MIN_STAKE,
+        &currency,
+        &10u32,
+        &9u32,
+        &(env.ledger().timestamp() + 7200),
+    );
+    assert_eq!(result, Err(Ok(Error::ExceedsPlayerCap)));
 }
 
 // ── create_pool duplicate rejection ───────────────────────────────────────────
