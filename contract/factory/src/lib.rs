@@ -20,6 +20,7 @@ const POOL_COUNT_KEY: Symbol = symbol_short!("P_CNT");
 const SCHEMA_VERSION_KEY: Symbol = symbol_short!("S_VER");
 const PAUSED_KEY: Symbol = symbol_short!("PAUSED");
 const TOKEN_COUNT_KEY: Symbol = symbol_short!("TOK_CNT");
+const MAX_PLAYERS_CAP_KEY: Symbol = symbol_short!("MAX_PLR");
 
 // ── Fee timelock storage keys ─────────────────────────────────────────────────
 const WIN_FEE_BPS_KEY: Symbol = symbol_short!("FEE_BPS");
@@ -71,6 +72,21 @@ pub struct ArenaRef {
 
 const MAX_POOL_CAPACITY: u32 = 256;
 const MAX_PAGE_SIZE: u32 = 50;
+
+// ── Player-cap (DoS hardening, see issue #495) ────────────────────────────────
+//
+// `resolve_round()` iterates over every registered player, so an unbounded
+// `max_players` lets a malicious host exhaust the Soroban CPU budget and
+// permanently lock entry fees. Enforce a protocol-wide hard cap in the factory
+// — the host's per-arena `capacity` is always validated against
+// `max_players_cap()` before deployment, regardless of what the host or
+// downstream arena contract permit.
+
+/// Default value of the configurable player cap (used when storage is unset).
+pub const MAX_PLAYERS_HARD_CAP: u32 = 64;
+/// Absolute upper bound for `set_max_players_cap` — the admin can never raise
+/// the cap above this, even via governance, so the DoS surface stays bounded.
+pub const MAX_PLAYERS_ABSOLUTE_CAP: u32 = 128;
 
 #[contracttype]
 #[derive(Clone)]
@@ -173,6 +189,10 @@ pub enum Error {
     EmptyTokenWhitelist = 23,
     /// Token address does not expose the expected SAC interface.
     InvalidTokenContract = 24,
+    /// Requested `capacity` exceeds the protocol-wide player cap. See issue #495.
+    ExceedsPlayerCap = 25,
+    /// `set_max_players_cap` called with a value outside `[2, MAX_PLAYERS_ABSOLUTE_CAP]`.
+    InvalidPlayerCap = 26,
 
 }
 
@@ -367,6 +387,39 @@ impl FactoryContract {
             .unwrap_or(DEFAULT_MIN_STAKE)
     }
 
+    // ── Player cap ────────────────────────────────────────────────────────────
+
+    /// Return the protocol-wide cap on `max_players` for new arenas.
+    /// Defaults to [`MAX_PLAYERS_HARD_CAP`] (64) until the admin overrides it.
+    pub fn max_players_cap(env: Env) -> u32 {
+        env.storage()
+            .instance()
+            .get(&MAX_PLAYERS_CAP_KEY)
+            .unwrap_or(MAX_PLAYERS_HARD_CAP)
+    }
+
+    /// Update the protocol-wide cap on `max_players`. Admin-only.
+    ///
+    /// The new value must be in `[2, MAX_PLAYERS_ABSOLUTE_CAP]` so the cap can
+    /// never be raised beyond an absolute ceiling that keeps `resolve_round`
+    /// well within the Soroban CPU budget.
+    ///
+    /// # Errors
+    /// * [`Error::InvalidPlayerCap`] — `new_cap` is below 2 or above
+    ///   [`MAX_PLAYERS_ABSOLUTE_CAP`].
+    pub fn set_max_players_cap(env: Env, new_cap: u32) -> Result<(), Error> {
+        let admin = require_admin(&env)?;
+        require_not_paused(&env)?;
+        admin.require_auth();
+        if new_cap < 2 || new_cap > MAX_PLAYERS_ABSOLUTE_CAP {
+            return Err(Error::InvalidPlayerCap);
+        }
+        env.storage()
+            .instance()
+            .set(&MAX_PLAYERS_CAP_KEY, &new_cap);
+        Ok(())
+    }
+
     // ── Fee timelock ──────────────────────────────────────────────────────────
 
     /// Return the current effective platform win fee in basis points.
@@ -487,6 +540,7 @@ impl FactoryContract {
     /// * [`Error::UnsupportedToken`] — `currency` has not been added via `add_supported_token`.
     /// * [`Error::Unauthorized`] — `caller` is neither admin nor whitelisted.
     /// * [`Error::InvalidCapacity`] — `capacity` is < 2 or > `MAX_POOL_CAPACITY`.
+    /// * [`Error::ExceedsPlayerCap`] — `capacity` exceeds `max_players_cap()`.
     /// * [`Error::InvalidStakeAmount`] — `stake_amount` is zero or negative.
     /// * [`Error::StakeBelowMinimum`] — `stake_amount` is below the configured minimum.
     /// * [`Error::WasmHashNotSet`] — `set_arena_wasm_hash` has not been called yet.
@@ -524,6 +578,9 @@ impl FactoryContract {
 
         if capacity < 2 || capacity > MAX_POOL_CAPACITY {
             return Err(Error::InvalidCapacity);
+        }
+        if capacity > Self::max_players_cap(env.clone()) {
+            return Err(Error::ExceedsPlayerCap);
         }
 
         let min_stake = Self::get_min_stake(env.clone());
