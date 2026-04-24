@@ -1,14 +1,8 @@
 #![no_std]
 
-<<<<<<< feat/close-473-479-484
 use soroban_sdk::{
-    contract, contracterror, contractimpl, contracttype, panic_with_error, symbol_short, token,
-    Address, Bytes, BytesN, Env, IntoVal, String, Symbol, Vec,
-=======
-use soroban_sdk::{IntoVal,
-    Address, Bytes, BytesN, Env, String, Symbol, Vec, contract, contracterror, contractimpl,
-    contracttype, panic_with_error, symbol_short, token,
->>>>>>> main
+    Address, Bytes, BytesN, Env, IntoVal, String, Symbol, Vec, contract, contracterror,
+    contractimpl, contracttype, panic_with_error, symbol_short, token,
 };
 
 mod bounds;
@@ -65,19 +59,12 @@ const TOPIC_ARENA_STARTED: Symbol = symbol_short!("A_START");
 const TOPIC_UPGRADE_PROPOSED: Symbol = symbol_short!("UP_PROP");
 const TOPIC_UPGRADE_EXECUTED: Symbol = symbol_short!("UP_EXEC");
 const TOPIC_UPGRADE_CANCELLED: Symbol = symbol_short!("UP_CANC");
-
-<<<<<<< feat/close-473-479-484
-=======
 const TOPIC_YIELD_HARVESTED: Symbol = symbol_short!("Y_HARV");
 const TOPIC_VAULT_FALLBACK: Symbol = symbol_short!("V_FALL");
 const TOPIC_ADMIN_PROPOSED: Symbol = symbol_short!("AD_PROP");
 const TOPIC_ADMIN_ACCEPTED: Symbol = symbol_short!("AD_DONE");
 const TOPIC_ADMIN_CANCELLED: Symbol = symbol_short!("AD_CANC");
-
-
-
-
->>>>>>> main
+const TOPIC_FUNDS_DEPOSITED: Symbol = symbol_short!("F_DEP");
 const EVENT_VERSION: u32 = 1;
 
 // ── Error codes ───────────────────────────────────────────────────────────────
@@ -162,6 +149,7 @@ pub struct ArenaConfig {
     /// Payout uses this value rather than the current global fee so that
     /// fee changes cannot retroactively affect an in-progress game.
     pub win_fee_bps: u32,
+    pub reserve_ratio_bps: u32,
     pub is_private: bool,
 }
 
@@ -322,8 +310,6 @@ pub struct ArenaSnapshot {
     pub potential_payout: i128,
 }
 
-<<<<<<< feat/close-473-479-484
-=======
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct YieldHarvested {
@@ -354,11 +340,23 @@ pub struct AdminTransferCompleted {
     pub new_admin: Address,
 }
 
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FundsDeposited {
+    pub arena_id: u64,
+    pub amount: i128,
+    pub shares: i128,
+    pub vault_address: Address,
+}
+
 macro_rules! assert_state {
     ($current:expr, $expected:pat) => {
         match $current {
-            $expected => {},
-            _ => panic!("Invalid state transition: current state {:?} is not allowed for this operation", $current),
+            $expected => {}
+            _ => panic!(
+                "Invalid state transition: current state {:?} is not allowed for this operation",
+                $current
+            ),
         }
     };
 }
@@ -378,17 +376,15 @@ macro_rules! assert_is_host {
 /// Returns `Err(ArenaError::Unauthorized)` if the check fails.
 macro_rules! assert_is_survivor {
     ($env:expr, $player:expr) => {
-        if !$env.storage().persistent().has(&DataKey::Survivor($player.clone())) {
+        if !$env
+            .storage()
+            .persistent()
+            .has(&DataKey::Survivor($player.clone()))
+        {
             return Err(ArenaError::Unauthorized);
         }
     };
 }
-
-
-
-
-
->>>>>>> main
 #[contracttype]
 #[derive(Clone)]
 enum DataKey {
@@ -534,6 +530,7 @@ impl ArenaContract {
                 grace_period_seconds: bounds::DEFAULT_GRACE_PERIOD_SECONDS,
                 join_deadline,
                 win_fee_bps,
+                reserve_ratio_bps: 1_000,
                 is_private: false,
             },
         );
@@ -593,6 +590,18 @@ impl ArenaContract {
         config.winner_yield_share_bps = bps;
         env.storage().instance().set(&DataKey::Config, &config);
         env.storage().instance().set(&WINNER_SHARE_KEY, &bps);
+        Ok(())
+    }
+
+    pub fn set_reserve_ratio_bps(env: Env, bps: u32) -> Result<(), ArenaError> {
+        let admin = Self::admin(env.clone());
+        admin.require_auth();
+        if bps > 10_000 {
+            return Err(ArenaError::InvalidAmount);
+        }
+        let mut config = get_config(&env)?;
+        config.reserve_ratio_bps = bps;
+        env.storage().instance().set(&DataKey::Config, &config);
         Ok(())
     }
 
@@ -676,6 +685,20 @@ impl ArenaContract {
                 entry_fee: amount,
             },
         );
+
+        let updated_count = count + 1;
+        if updated_count >= capacity && state(&env) == ArenaState::Pending {
+            activate_arena_internal(&env, arena_id, 1, config.round_speed_in_ledgers)?;
+            let prize_pool: i128 = env.storage().instance().get(&PRIZE_POOL_KEY).unwrap_or(0);
+            env.events().publish(
+                (TOPIC_ARENA_STARTED,),
+                ArenaStarted {
+                    arena_id,
+                    player_count: updated_count,
+                    prize_pool,
+                },
+            );
+        }
         Ok(())
     }
 
@@ -784,8 +807,10 @@ impl ArenaContract {
         if survivors < 2 {
             return Err(ArenaError::NotEnoughPlayers);
         }
+        let arena_id: u64 = env.storage().instance().get(&DataKey::ArenaId).unwrap_or(0);
         activate_arena_internal(
             &env,
+            arena_id,
             previous.round_number + 1,
             config.round_speed_in_ledgers,
         )
@@ -821,7 +846,7 @@ impl ArenaContract {
         }
 
         let config = get_config(&env)?;
-        let round = activate_arena_internal(&env, 1, config.round_speed_in_ledgers)?;
+        let round = activate_arena_internal(&env, arena_id, 1, config.round_speed_in_ledgers)?;
         let prize_pool: i128 = env.storage().instance().get(&PRIZE_POOL_KEY).unwrap_or(0);
         env.events().publish(
             (TOPIC_ARENA_STARTED,),
@@ -1474,11 +1499,7 @@ impl ArenaContract {
             .instance()
             .get(&TOKEN_KEY)
             .ok_or(ArenaError::TokenNotSet)?;
-        let prize_pool: i128 = env
-            .storage()
-            .instance()
-            .get(&PRIZE_POOL_KEY)
-            .unwrap_or(0);
+        let prize_pool: i128 = env.storage().instance().get(&PRIZE_POOL_KEY).unwrap_or(0);
         if prize_pool <= 0 {
             return Err(ArenaError::InvalidAmount);
         }
@@ -1493,7 +1514,9 @@ impl ArenaContract {
             soroban_sdk::vec![&env, token_addr.into_val(&env), prize_pool.into_val(&env)],
         );
         env.storage().instance().set(&VAULT_SHARES_KEY, &shares);
-        env.storage().instance().set(&VAULT_DEPOSITED_KEY, &prize_pool);
+        env.storage()
+            .instance()
+            .set(&VAULT_DEPOSITED_KEY, &prize_pool);
         Ok(shares)
     }
 
@@ -1533,11 +1556,7 @@ impl ArenaContract {
                 .instance()
                 .get(&VAULT_ADDR_KEY)
                 .ok_or(ArenaError::VaultNotSet)?;
-            let shares: i128 = env
-                .storage()
-                .instance()
-                .get(&VAULT_SHARES_KEY)
-                .unwrap_or(0);
+            let shares: i128 = env.storage().instance().get(&VAULT_SHARES_KEY).unwrap_or(0);
             // Vault interface: withdraw(shares: i128) -> i128 (tokens returned)
             let total_received: i128 = env.invoke_contract(
                 &vault_addr,
@@ -1547,11 +1566,7 @@ impl ArenaContract {
             let y = (total_received - deposited).max(0);
             (total_received - y, y)
         } else {
-            let prize_pool: i128 = env
-                .storage()
-                .instance()
-                .get(&PRIZE_POOL_KEY)
-                .unwrap_or(0);
+            let prize_pool: i128 = env.storage().instance().get(&PRIZE_POOL_KEY).unwrap_or(0);
             (prize_pool, 0)
         };
         let arena_id: u64 = env.storage().instance().get(&DataKey::ArenaId).unwrap_or(0);
@@ -1614,7 +1629,10 @@ impl ArenaContract {
         env.storage().instance().remove(&ADMIN_EXPIRY_KEY);
         env.events().publish(
             (TOPIC_ADMIN_ACCEPTED,),
-            AdminTransferCompleted { old_admin, new_admin },
+            AdminTransferCompleted {
+                old_admin,
+                new_admin,
+            },
         );
         Ok(())
     }
@@ -1681,14 +1699,18 @@ fn apply_winner_distribution(
         .persistent()
         .set(&DataKey::Winner(player.clone()), &true);
     env.storage().instance().set(&WINNER_ADDR_KEY, &player);
-    env.storage().instance().set(&PRIZE_POOL_KEY, &principal_pool);
+    env.storage()
+        .instance()
+        .set(&PRIZE_POOL_KEY, &principal_pool);
     env.storage().instance().set(&YIELD_KEY, &yield_earned);
     for eliminated_player in eliminated.iter() {
         env.storage()
             .persistent()
             .set(&DataKey::Claimable(eliminated_player), &per_eliminated);
     }
-    env.storage().instance().set(&STATE_KEY, &ArenaState::Completed);
+    env.storage()
+        .instance()
+        .set(&STATE_KEY, &ArenaState::Completed);
     let arena_id: u64 = env.storage().instance().get(&DataKey::ArenaId).unwrap_or(0);
     env.events().publish(
         (TOPIC_YIELD_DISTRIBUTED,),
@@ -1834,9 +1856,14 @@ fn set_state(env: &Env, new_state: ArenaState) {
 
 fn activate_arena_internal(
     env: &Env,
+    arena_id: u64,
     round_number: u32,
     round_speed_in_ledgers: u32,
 ) -> Result<RoundState, ArenaError> {
+    if state(env) == ArenaState::Pending {
+        auto_deposit_entry_fees(env, arena_id)?;
+    }
+
     let start = env.ledger().sequence();
     let deadline = start
         .checked_add(round_speed_in_ledgers)
@@ -1853,6 +1880,83 @@ fn activate_arena_internal(
     env.storage().instance().set(&DataKey::Round, &round);
     set_state(env, ArenaState::Active);
     Ok(round)
+}
+
+fn auto_deposit_entry_fees(env: &Env, arena_id: u64) -> Result<(), ArenaError> {
+    if env.storage().instance().has(&VAULT_SHARES_KEY) {
+        return Ok(());
+    }
+
+    let vault_active: bool = env
+        .storage()
+        .instance()
+        .get(&VAULT_ACTIVE_KEY)
+        .unwrap_or(false);
+    if !vault_active {
+        return Ok(());
+    }
+
+    let vault_addr: Address = env
+        .storage()
+        .instance()
+        .get(&VAULT_ADDR_KEY)
+        .ok_or(ArenaError::VaultNotSet)?;
+    let token_addr: Address = env
+        .storage()
+        .instance()
+        .get(&TOKEN_KEY)
+        .ok_or(ArenaError::TokenNotSet)?;
+    let config = get_config(env)?;
+    let player_count: i128 = env
+        .storage()
+        .instance()
+        .get::<_, u32>(&SURVIVOR_COUNT_KEY)
+        .unwrap_or(0) as i128;
+    if player_count <= 0 {
+        return Ok(());
+    }
+
+    let total_depositable = config
+        .required_stake_amount
+        .checked_mul(player_count)
+        .ok_or(ArenaError::InvalidAmount)?;
+    let reserve_amount = total_depositable
+        .checked_mul(config.reserve_ratio_bps as i128)
+        .and_then(|v| v.checked_div(BPS_DENOMINATOR))
+        .ok_or(ArenaError::InvalidAmount)?;
+    let deposit_amount = total_depositable.saturating_sub(reserve_amount);
+    if deposit_amount <= 0 {
+        return Ok(());
+    }
+
+    token::Client::new(env, &token_addr).transfer(
+        &env.current_contract_address(),
+        &vault_addr,
+        &deposit_amount,
+    );
+    let shares: i128 = env.invoke_contract(
+        &vault_addr,
+        &soroban_sdk::Symbol::new(env, "deposit"),
+        soroban_sdk::vec![env, token_addr.into_val(env), deposit_amount.into_val(env)],
+    );
+
+    env.storage().instance().set(&VAULT_SHARES_KEY, &shares);
+    env.storage()
+        .instance()
+        .set(&VAULT_DEPOSITED_KEY, &deposit_amount);
+    env.storage()
+        .instance()
+        .set(&PRIZE_POOL_KEY, &reserve_amount);
+    env.events().publish(
+        (TOPIC_FUNDS_DEPOSITED,),
+        FundsDeposited {
+            arena_id,
+            amount: deposit_amount,
+            shares,
+            vault_address: vault_addr,
+        },
+    );
+    Ok(())
 }
 
 fn capacity(env: &Env) -> u32 {
@@ -1966,7 +2070,7 @@ mod abi_guard;
 #[cfg(test)]
 mod yield_share_tests {
     use super::*;
-    use soroban_sdk::{testutils::Address as _, token::StellarAssetClient, IntoVal};
+    use soroban_sdk::{IntoVal, testutils::Address as _, token::StellarAssetClient};
 
     fn setup(bps: u32) -> (Env, ArenaContractClient<'static>, Address, Vec<Address>) {
         let env = Env::default();
