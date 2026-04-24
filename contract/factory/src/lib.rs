@@ -6,7 +6,7 @@ use soroban_sdk::{
 };
 
 #[cfg(test)]
-use arena::ArenaContract;
+use arena::ArenaContract; 
 
 // ── Storage keys ─────────────────────────────────────────────────────────────
 
