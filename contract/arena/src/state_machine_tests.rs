@@ -111,7 +111,7 @@ fn test_transition_pending_to_cancelled() {
     let deadline = env.ledger().timestamp() + 7200;
     client.init(&2, &100, &deadline);
 
-    client.cancel_arena();
+    client.cancel_arena(&client.admin());
     assert_eq!(client.state(), ArenaState::Cancelled);
 }
 

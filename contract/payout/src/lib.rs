@@ -6,8 +6,12 @@ use soroban_sdk::{
 };
 
 const ADMIN_KEY: Symbol = symbol_short!("ADMIN");
+const PENDING_ADMIN_KEY: Symbol = symbol_short!("P_ADMIN");
+const ADMIN_EXPIRY_KEY: Symbol = symbol_short!("A_EXP");
 const TREASURY_KEY: Symbol = symbol_short!("TREAS");
 const PAUSED_KEY: Symbol = symbol_short!("PAUSED");
+
+const ADMIN_TRANSFER_EXPIRY: u64 = 7 * 24 * 60 * 60;
 const PAYOUT_COUNT_KEY: Symbol = symbol_short!("P_COUNT");
 const PENDING_HASH_KEY: Symbol = symbol_short!("P_HASH");
 const EXECUTE_AFTER_KEY: Symbol = symbol_short!("P_AFTER");
@@ -18,6 +22,9 @@ const TOPIC_UNPAUSED: Symbol = symbol_short!("UNPAUSED");
 const TOPIC_UPGRADE_PROPOSED: Symbol = symbol_short!("UP_PROP");
 const TOPIC_UPGRADE_EXECUTED: Symbol = symbol_short!("UP_EXEC");
 const TOPIC_UPGRADE_CANCELLED: Symbol = symbol_short!("UP_CANC");
+const TOPIC_ADMIN_PROPOSED: Symbol = symbol_short!("AD_PROP");
+const TOPIC_ADMIN_ACCEPTED: Symbol = symbol_short!("AD_DONE");
+const TOPIC_ADMIN_CANCELLED: Symbol = symbol_short!("AD_CANC");
 
 const FACTORY_KEY: Symbol = symbol_short!("FACTORY");
 
@@ -111,6 +118,9 @@ pub enum PayoutError {
     TimelockNotExpired = 8,
     UpgradeAlreadyPending = 9,
     HashMismatch = 10,
+    NoPendingAdminTransfer = 11,
+    AdminTransferExpired = 12,
+    Unauthorized = 13,
 }
 
 #[contract]
@@ -558,6 +568,78 @@ impl PayoutContract {
         let after: Option<u64> = env.storage().instance().get(&EXECUTE_AFTER_KEY);
         match (hash, after) {
             (Some(h), Some(a)) => Some((h, a)),
+            _ => None,
+        }
+    }
+
+    // ── Two-step admin transfer ───────────────────────────────────────────────
+
+    /// Propose a new admin. The pending admin has 7 days to call `accept_admin`.
+    pub fn propose_admin(env: Env, new_admin: Address) -> Result<(), PayoutError> {
+        let admin = Self::admin(env.clone());
+        admin.require_auth();
+        let expires_at = env.ledger().timestamp() + ADMIN_TRANSFER_EXPIRY;
+        env.storage().instance().set(&PENDING_ADMIN_KEY, &new_admin);
+        env.storage().instance().set(&ADMIN_EXPIRY_KEY, &expires_at);
+        env.events().publish(
+            (TOPIC_ADMIN_PROPOSED,),
+            (EVENT_VERSION, admin, new_admin, expires_at),
+        );
+        Ok(())
+    }
+
+    /// Accept a pending admin transfer. Must be called by the proposed new admin
+    /// within 7 days.
+    pub fn accept_admin(env: Env, new_admin: Address) -> Result<(), PayoutError> {
+        new_admin.require_auth();
+        let pending: Address = env
+            .storage()
+            .instance()
+            .get(&PENDING_ADMIN_KEY)
+            .ok_or(PayoutError::NoPendingAdminTransfer)?;
+        if pending != new_admin {
+            return Err(PayoutError::Unauthorized);
+        }
+        let expires_at: u64 = env
+            .storage()
+            .instance()
+            .get(&ADMIN_EXPIRY_KEY)
+            .ok_or(PayoutError::NoPendingAdminTransfer)?;
+        if env.ledger().timestamp() > expires_at {
+            env.storage().instance().remove(&PENDING_ADMIN_KEY);
+            env.storage().instance().remove(&ADMIN_EXPIRY_KEY);
+            return Err(PayoutError::AdminTransferExpired);
+        }
+        let old_admin = Self::admin(env.clone());
+        env.storage().instance().set(&ADMIN_KEY, &new_admin);
+        env.storage().instance().remove(&PENDING_ADMIN_KEY);
+        env.storage().instance().remove(&ADMIN_EXPIRY_KEY);
+        env.events().publish(
+            (TOPIC_ADMIN_ACCEPTED,),
+            (EVENT_VERSION, old_admin, new_admin),
+        );
+        Ok(())
+    }
+
+    /// Cancel a pending admin transfer. Only the current admin may call this.
+    pub fn cancel_admin_transfer(env: Env) -> Result<(), PayoutError> {
+        let admin = Self::admin(env.clone());
+        admin.require_auth();
+        if !env.storage().instance().has(&PENDING_ADMIN_KEY) {
+            return Err(PayoutError::NoPendingAdminTransfer);
+        }
+        env.storage().instance().remove(&PENDING_ADMIN_KEY);
+        env.storage().instance().remove(&ADMIN_EXPIRY_KEY);
+        env.events().publish((TOPIC_ADMIN_CANCELLED,), (EVENT_VERSION,));
+        Ok(())
+    }
+
+    /// Return the pending admin address and expiry timestamp, or `None` if none.
+    pub fn pending_admin_transfer(env: Env) -> Option<(Address, u64)> {
+        let addr: Option<Address> = env.storage().instance().get(&PENDING_ADMIN_KEY);
+        let exp: Option<u64> = env.storage().instance().get(&ADMIN_EXPIRY_KEY);
+        match (addr, exp) {
+            (Some(a), Some(e)) => Some((a, e)),
             _ => None,
         }
     }

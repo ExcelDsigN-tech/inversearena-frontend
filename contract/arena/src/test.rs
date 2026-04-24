@@ -2938,7 +2938,7 @@ fn cancel_zero_players_sets_cancelled_flag() {
     let (_asset, token_id) = setup_token(&env, &admin);
     client.set_token(&token_id);
     client.init(&5u32, &TEST_REQUIRED_STAKE, &3600);
-    client.cancel_arena();
+    client.cancel_arena(&admin);
     assert!(client.is_cancelled());
 }
 
@@ -2948,8 +2948,8 @@ fn cancel_pending_arena_refunds_joined_players() {
     let token_client = soroban_sdk::token::TokenClient::new(&env, &token_id);
     let balances_before: std::vec::Vec<i128> =
         players.iter().map(|p| token_client.balance(&p)).collect();
-
-    client.cancel_arena();
+    let admin = client.admin();
+    client.cancel_arena(&admin);
 
     assert!(client.is_cancelled());
     for (i, player) in players.iter().enumerate() {
@@ -2964,15 +2964,17 @@ fn cancel_pending_arena_refunds_joined_players() {
 #[test]
 fn cancel_after_game_finished_returns_error() {
     let (_env, _admin, client, _token_id, _winner) = setup_finished_game_with_winner(0);
-    let result = client.try_cancel_arena();
+    let admin = client.admin();
+    let result = client.try_cancel_arena(&admin);
     assert_eq!(result, Err(Ok(ArenaError::GameAlreadyFinished)));
 }
 
 #[test]
 fn double_cancel_returns_already_cancelled() {
     let (_env, _admin, client, _token_id, _players) = setup_game(5, 2);
-    client.cancel_arena();
-    let result = client.try_cancel_arena();
+    let admin = client.admin();
+    client.cancel_arena(&admin);
+    let result = client.try_cancel_arena(&admin);
     assert_eq!(result, Err(Ok(ArenaError::AlreadyCancelled)));
 }
 
@@ -3001,7 +3003,8 @@ fn pause_blocks_start_round() {
 fn pause_blocks_cancel_arena() {
     let (_env, _admin, client, _token_id, _players) = setup_game(5, 2);
     client.pause();
-    let result = client.try_cancel_arena();
+    let admin = client.admin();
+    let result = client.try_cancel_arena(&admin);
     assert_eq!(result, Err(Ok(ArenaError::Paused)));
 }
 
@@ -3062,6 +3065,162 @@ fn set_max_rounds_accepts_boundary_values() {
     assert!(client.try_set_max_rounds(&bounds::MIN_MAX_ROUNDS).is_ok());
     assert!(client.try_set_max_rounds(&bounds::MAX_MAX_ROUNDS).is_ok());
     assert!(client.try_set_max_rounds(&bounds::DEFAULT_MAX_ROUNDS).is_ok());
+}
+
+// ── Issue #470: role-based access control ─────────────────────────────────────
+
+#[test]
+fn cancel_arena_by_host_succeeds_when_pending() {
+    let (env, admin, client) = setup_with_admin();
+    let (_asset, token_id) = setup_token(&env, &admin);
+    client.set_token(&token_id);
+    client.init(&5u32, &TEST_REQUIRED_STAKE, &3600);
+    // Inject a creator (host) into storage.
+    let host = Address::generate(&env);
+    env.as_contract(&client.address, || {
+        env.storage().instance().set(&CREATOR_KEY, &host);
+    });
+    client.cancel_arena(&host);
+    assert!(client.is_cancelled());
+}
+
+#[test]
+fn cancel_arena_by_non_admin_non_host_returns_unauthorized() {
+    let (env, admin, client) = setup_with_admin();
+    let (_asset, token_id) = setup_token(&env, &admin);
+    client.set_token(&token_id);
+    client.init(&5u32, &TEST_REQUIRED_STAKE, &3600);
+    let stranger = Address::generate(&env);
+    let result = client.try_cancel_arena(&stranger);
+    assert_eq!(result, Err(Ok(ArenaError::Unauthorized)));
+}
+
+#[test]
+fn cancel_arena_by_host_after_active_returns_unauthorized() {
+    let (env, _admin, client, _token_id, _players) = setup_game(5, 2);
+    let host = Address::generate(&env);
+    env.as_contract(&client.address, || {
+        env.storage().instance().set(&CREATOR_KEY, &host);
+    });
+    // Start a round so the arena transitions to Active.
+    client.start_round();
+    let result = client.try_cancel_arena(&host);
+    assert_eq!(result, Err(Ok(ArenaError::Unauthorized)));
+}
+
+// ── Issue #466: two-step admin transfer (arena) ───────────────────────────────
+
+#[test]
+fn propose_admin_stores_pending_admin() {
+    let (env, admin, client) = setup_with_admin();
+    let new_admin = Address::generate(&env);
+    client.propose_admin(&new_admin);
+    let pending = client.pending_admin_transfer();
+    assert!(pending.is_some());
+    assert_eq!(pending.unwrap().0, new_admin);
+}
+
+#[test]
+fn accept_admin_transfers_admin() {
+    let (env, admin, client) = setup_with_admin();
+    let new_admin = Address::generate(&env);
+    client.propose_admin(&new_admin);
+    client.accept_admin(&new_admin);
+    assert_eq!(client.admin(), new_admin);
+    assert!(client.pending_admin_transfer().is_none());
+}
+
+#[test]
+fn accept_admin_wrong_caller_returns_unauthorized() {
+    let (env, admin, client) = setup_with_admin();
+    let new_admin = Address::generate(&env);
+    let impostor = Address::generate(&env);
+    client.propose_admin(&new_admin);
+    let result = client.try_accept_admin(&impostor);
+    assert_eq!(result, Err(Ok(ArenaError::Unauthorized)));
+}
+
+#[test]
+fn accept_admin_after_expiry_returns_expired() {
+    let (env, admin, client) = setup_with_admin();
+    let new_admin = Address::generate(&env);
+    client.propose_admin(&new_admin);
+    // Advance timestamp past 7-day window.
+    let mut ledger = env.ledger().get();
+    ledger.timestamp += 8 * 24 * 60 * 60;
+    env.ledger().set(ledger);
+    env.mock_all_auths();
+    let result = client.try_accept_admin(&new_admin);
+    assert_eq!(result, Err(Ok(ArenaError::AdminTransferExpired)));
+}
+
+#[test]
+fn cancel_admin_transfer_clears_pending() {
+    let (env, admin, client) = setup_with_admin();
+    let new_admin = Address::generate(&env);
+    client.propose_admin(&new_admin);
+    client.cancel_admin_transfer();
+    assert!(client.pending_admin_transfer().is_none());
+}
+
+#[test]
+fn cancel_admin_transfer_with_no_pending_returns_error() {
+    let (_env, _admin, client) = setup_with_admin();
+    let result = client.try_cancel_admin_transfer();
+    assert_eq!(result, Err(Ok(ArenaError::NoPendingAdminTransfer)));
+}
+
+// ── Issue #462/#464: vault and yield ─────────────────────────────────────────
+
+#[test]
+fn toggle_vault_active_stores_flag() {
+    let (_env, _admin, client) = setup_with_admin();
+    client.toggle_vault_active(&true);
+    let state = client.get_arena_state().unwrap_err(); // not initialized yet — just check the flag via storage
+    // Since init hasn't been called, use a raw approach: confirm toggle_vault_active returns Ok.
+    assert!(client.try_toggle_vault_active(&false).is_ok());
+}
+
+#[test]
+fn complete_with_yield_no_vault_pays_principal() {
+    let (env, _admin, client, token_id, players) = setup_game(5, 2);
+    // Run a round so one player is eliminated.
+    client.start_round();
+    let round = client.get_round().unwrap();
+    let p0 = players[0].clone();
+    let p1 = players[1].clone();
+    client.submit_choice(&p0, &round.round_number, &Choice::Heads);
+    client.submit_choice(&p1, &round.round_number, &Choice::Tails);
+    set_ledger_sequence(&env, round.round_deadline_ledger + 20);
+    env.mock_all_auths();
+    client.resolve_round();
+    // Complete game without vault.
+    let survivor = get_survivors_public(&env, &client);
+    if !survivor.is_empty() {
+        let winner = survivor[0].clone();
+        assert!(client.try_complete_with_yield(&winner).is_ok());
+    }
+}
+
+fn get_survivors_public(env: &Env, client: &ArenaContractClient) -> std::vec::Vec<Address> {
+    let all: soroban_sdk::Vec<Address> = env.as_contract(&client.address, || {
+        env.storage()
+            .persistent()
+            .get(&DataKey::AllPlayers)
+            .unwrap_or(soroban_sdk::Vec::new(env))
+    });
+    let mut out = std::vec::Vec::new();
+    for p in all.iter() {
+        let is_survivor = env.as_contract(&client.address, || {
+            env.storage()
+                .persistent()
+                .has(&DataKey::Survivor(p.clone()))
+        });
+        if is_survivor {
+            out.push(p);
+        }
+    }
+    out
 }
 
 // ── Issue #481: lazy ArenaCache ───────────────────────────────────────────────

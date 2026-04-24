@@ -1,7 +1,7 @@
 {
-  "schema_version": "1.1.0",
+  "schema_version": "1.2.0",
   "contract": "arena",
-  "source_sha256": "31d12f33a2d56fe19c8693a588ab0e85540d0e8c58fa5948036b457588a4342e",
+  "source_sha256": "regenerate_after_build",
   "generator": "contract/scripts/generate_abi_snapshots.sh",
   "breaking_change_ack": "Bump schema_version and document in release notes when entrypoints, events, or error ordinals change.",
   "arena_error": {
@@ -50,7 +50,15 @@
     "DeadlineTooFar": 43,
     "DeadlineNotReached": 44,
     "HashMismatch": 45,
-    "InvalidGracePeriod": 46
+    "InvalidGracePeriod": 46,
+    "NotWhitelisted": 47,
+    "BatchAlreadyInProgress": 48,
+    "NoBatchInProgress": 49,
+    "BatchNotComplete": 50,
+    "Unauthorized": 51,
+    "NoPendingAdminTransfer": 52,
+    "AdminTransferExpired": 53,
+    "VaultNotSet": 54
   },
   "event_topics": [
     "UP_PROP",
@@ -62,7 +70,12 @@
     "R_TOUT",
     "RSLVD",
     "WIN_SET",
-    "CLAIM"
+    "CLAIM",
+    "Y_HARV",
+    "V_FALL",
+    "AD_PROP",
+    "AD_DONE",
+    "AD_CANC"
   ],
   "exported_functions": [
     "init",
@@ -100,6 +113,16 @@
     "get_metadata",
     "state",
     "get_arena_state_view",
-    "init_factory"
+    "init_factory",
+    "cancel_arena",
+    "set_vault",
+    "set_fallback_vault",
+    "toggle_vault_active",
+    "deposit_to_vault",
+    "complete_with_yield",
+    "propose_admin",
+    "accept_admin",
+    "cancel_admin_transfer",
+    "pending_admin_transfer"
   ]
 }

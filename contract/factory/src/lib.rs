@@ -2,11 +2,7 @@
 
 use soroban_sdk::{
     Address, BytesN, Env, IntoVal, String, Symbol, Vec, contract, contracterror, contractimpl,
-<<<<<<< HEAD
-    contracttype, symbol_short, xdr::ToXdr, token,
-=======
     contracttype, symbol_short, token, xdr::ToXdr,
->>>>>>> 83c0ce16d2eca2bfab80651a454e22f3722b0af9
 };
 
 #[cfg(test)]
@@ -15,8 +11,12 @@ use arena::ArenaContract;
 // ── Storage keys ─────────────────────────────────────────────────────────────
 
 const ADMIN_KEY: Symbol = symbol_short!("ADMIN");
+const PENDING_ADMIN_KEY: Symbol = symbol_short!("P_ADMIN");
+const ADMIN_EXPIRY_KEY: Symbol = symbol_short!("A_EXP");
 const PENDING_HASH_KEY: Symbol = symbol_short!("P_HASH");
 const EXECUTE_AFTER_KEY: Symbol = symbol_short!("P_AFTER");
+
+const ADMIN_TRANSFER_EXPIRY: u64 = 7 * 24 * 60 * 60;
 const WHITELIST_PREFIX: Symbol = symbol_short!("WL");
 const MIN_STAKE_KEY: Symbol = symbol_short!("MIN_STK");
 const ARENA_WASM_HASH_KEY: Symbol = symbol_short!("AR_WASM");
@@ -119,6 +119,9 @@ const DEFAULT_MIN_STAKE: i128 = 10_000_000;
 const TOPIC_UPGRADE_PROPOSED: Symbol = symbol_short!("UP_PROP");
 const TOPIC_UPGRADE_EXECUTED: Symbol = symbol_short!("UP_EXEC");
 const TOPIC_UPGRADE_CANCELLED: Symbol = symbol_short!("UP_CANC");
+const TOPIC_ADMIN_PROPOSED: Symbol = symbol_short!("AD_PROP");
+const TOPIC_ADMIN_ACCEPTED: Symbol = symbol_short!("AD_DONE");
+const TOPIC_ADMIN_CANCELLED: Symbol = symbol_short!("AD_CANC");
 const TOPIC_POOL_CREATED: Symbol = symbol_short!("POOL_CRE");
 const TOPIC_HOST_WHITELISTED: Symbol = symbol_short!("WL_ADD");
 const TOPIC_HOST_REMOVED: Symbol = symbol_short!("WL_REM");
@@ -135,12 +138,7 @@ const TOPIC_ARENA_WL_REM: Symbol = symbol_short!("AWL_REM");
 const TOPIC_FEE_QUEUED: Symbol = symbol_short!("FEE_Q");
 const TOPIC_FEE_EXECUTED: Symbol = symbol_short!("FEE_EX");
 const TOPIC_FEE_CANCELLED: Symbol = symbol_short!("FEE_CAN");
-<<<<<<< HEAD
 const TOPIC_FEE_CONFIG_UPDATED: Symbol = symbol_short!("CRF_UP");
-=======
-const TOPIC_ARENA_WL_ADD: Symbol = symbol_short!("AWL_ADD");
-const TOPIC_ARENA_WL_REM: Symbol = symbol_short!("AWL_REM");
->>>>>>> 83c0ce16d2eca2bfab80651a454e22f3722b0af9
 
 /// Event payload version. Include in every event data tuple so consumers
 /// can detect schema changes without re-deploying indexers.
@@ -198,24 +196,24 @@ pub enum Error {
     NoPendingFeeUpdate = 20,
     /// Provided fee exceeds `MAX_WIN_FEE_BPS` (2000).
     FeeTooHigh = 21,
-<<<<<<< HEAD
     /// Creation fee amount is negative.
     InvalidCreationFee = 22,
     /// Host does not hold enough `fee_token` to pay the configured creation fee.
     InsufficientCreationFee = 23,
-=======
     /// Token is not currently on the allowed whitelist.
-    TokenNotAllowed = 22,
+    TokenNotAllowed = 24,
     /// Removing the token would leave whitelist empty.
-    EmptyTokenWhitelist = 23,
+    EmptyTokenWhitelist = 25,
     /// Token address does not expose the expected SAC interface.
-    InvalidTokenContract = 24,
+    InvalidTokenContract = 26,
     /// Requested `capacity` exceeds the protocol-wide player cap. See issue #495.
-    ExceedsPlayerCap = 25,
+    ExceedsPlayerCap = 27,
     /// `set_max_players_cap` called with a value outside `[2, MAX_PLAYERS_ABSOLUTE_CAP]`.
-    InvalidPlayerCap = 26,
-
->>>>>>> 83c0ce16d2eca2bfab80651a454e22f3722b0af9
+    InvalidPlayerCap = 28,
+    /// No pending admin transfer exists.
+    NoPendingAdminTransfer = 29,
+    /// Pending admin transfer has expired (7-day window elapsed).
+    AdminTransferExpired = 30,
 }
 
 // ── Contract ──────────────────────────────────────────────────────────────────
@@ -725,15 +723,6 @@ impl FactoryContract {
             addr
         };
 
-<<<<<<< HEAD
-        #[cfg(not(test))]
-        let arena_address = env
-            .deployer()
-            .with_current_contract(salt)
-            .deploy_v2(wasm_hash, ());
-
-=======
->>>>>>> 83c0ce16d2eca2bfab80651a454e22f3722b0af9
         // ── Initialisation ──────────────────────────────────────────────────────
         // Note: __constructor runs at deploy time (deploy_v2/register_at), so
         // there is no separate initialize() call needed here.
@@ -1225,6 +1214,79 @@ impl FactoryContract {
             .instance()
             .get(&PAUSED_KEY)
             .unwrap_or(false)
+    }
+
+    // ── Two-step admin transfer ───────────────────────────────────────────────
+
+    /// Propose a new admin. The pending admin has 7 days to call `accept_admin`.
+    /// Only the current admin may call this.
+    pub fn propose_admin(env: Env, new_admin: Address) -> Result<(), Error> {
+        let admin = require_admin(&env)?;
+        admin.require_auth();
+        let expires_at = env.ledger().timestamp() + ADMIN_TRANSFER_EXPIRY;
+        env.storage().instance().set(&PENDING_ADMIN_KEY, &new_admin);
+        env.storage().instance().set(&ADMIN_EXPIRY_KEY, &expires_at);
+        env.events().publish(
+            (TOPIC_ADMIN_PROPOSED,),
+            (EVENT_VERSION, admin, new_admin, expires_at),
+        );
+        Ok(())
+    }
+
+    /// Accept a pending admin transfer. Must be called by the proposed new admin
+    /// within 7 days of the proposal.
+    pub fn accept_admin(env: Env, new_admin: Address) -> Result<(), Error> {
+        new_admin.require_auth();
+        let pending: Address = env
+            .storage()
+            .instance()
+            .get(&PENDING_ADMIN_KEY)
+            .ok_or(Error::NoPendingAdminTransfer)?;
+        if pending != new_admin {
+            return Err(Error::Unauthorized);
+        }
+        let expires_at: u64 = env
+            .storage()
+            .instance()
+            .get(&ADMIN_EXPIRY_KEY)
+            .ok_or(Error::NoPendingAdminTransfer)?;
+        if env.ledger().timestamp() > expires_at {
+            env.storage().instance().remove(&PENDING_ADMIN_KEY);
+            env.storage().instance().remove(&ADMIN_EXPIRY_KEY);
+            return Err(Error::AdminTransferExpired);
+        }
+        let old_admin = require_admin(&env)?;
+        env.storage().instance().set(&ADMIN_KEY, &new_admin);
+        env.storage().instance().remove(&PENDING_ADMIN_KEY);
+        env.storage().instance().remove(&ADMIN_EXPIRY_KEY);
+        env.events().publish(
+            (TOPIC_ADMIN_ACCEPTED,),
+            (EVENT_VERSION, old_admin, new_admin),
+        );
+        Ok(())
+    }
+
+    /// Cancel a pending admin transfer. Only the current admin may call this.
+    pub fn cancel_admin_transfer(env: Env) -> Result<(), Error> {
+        let admin = require_admin(&env)?;
+        admin.require_auth();
+        if !env.storage().instance().has(&PENDING_ADMIN_KEY) {
+            return Err(Error::NoPendingAdminTransfer);
+        }
+        env.storage().instance().remove(&PENDING_ADMIN_KEY);
+        env.storage().instance().remove(&ADMIN_EXPIRY_KEY);
+        env.events().publish((TOPIC_ADMIN_CANCELLED,), (EVENT_VERSION,));
+        Ok(())
+    }
+
+    /// Return the pending admin address and expiry timestamp, or `None` if none.
+    pub fn pending_admin_transfer(env: Env) -> Option<(Address, u64)> {
+        let addr: Option<Address> = env.storage().instance().get(&PENDING_ADMIN_KEY);
+        let exp: Option<u64> = env.storage().instance().get(&ADMIN_EXPIRY_KEY);
+        match (addr, exp) {
+            (Some(a), Some(e)) => Some((a, e)),
+            _ => None,
+        }
     }
 }
 
