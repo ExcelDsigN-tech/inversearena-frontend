@@ -615,3 +615,35 @@ fn get_staker_stats_reports_even_pool_share() {
     assert_eq!(client.get_staker_stats(&first).stake_share_bps, 5_000);
     assert_eq!(client.get_staker_stats(&second).stake_share_bps, 5_000);
 }
+
+#[test]
+fn update_config_requires_positive_min_stake() {
+    let (_env, _admin, _staker, client, _token) = setup();
+    let cfg = StakingConfig {
+        token_address: client.token(),
+        min_stake: 0,
+        lock_period_seconds: 10,
+        max_stake_per_address: 1_000_000_000,
+        rewards_enabled: true,
+    };
+    assert_eq!(client.try_update_config(&cfg), Err(Ok(StakingError::InvalidAmount)));
+}
+
+#[test]
+fn stake_rejects_below_min_and_above_max() {
+    let (_env, _admin, staker, client, _token) = setup();
+    let cfg = StakingConfig {
+        token_address: client.token(),
+        min_stake: 100,
+        lock_period_seconds: 0,
+        max_stake_per_address: 150,
+        rewards_enabled: true,
+    };
+    client.update_config(&cfg);
+    assert_eq!(client.try_stake(&staker, &99), Err(Ok(StakingError::BelowMinStake)));
+    client.stake(&staker, &100);
+    assert_eq!(
+        client.try_stake(&staker, &60),
+        Err(Ok(StakingError::ExceedsMaxStake))
+    );
+}

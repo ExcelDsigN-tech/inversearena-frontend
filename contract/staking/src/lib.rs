@@ -21,6 +21,8 @@ const PENDING_HASH_KEY: Symbol = symbol_short!("P_HASH");
 const EXECUTE_AFTER_KEY: Symbol = symbol_short!("P_AFTER");
 const LOCK_PERIOD_KEY: Symbol = symbol_short!("LOCK_SEC");
 const MIN_STAKE_KEY: Symbol = symbol_short!("MIN_STK");
+const MAX_STAKE_KEY: Symbol = symbol_short!("MAX_STK");
+const REWARDS_ENABLED_KEY: Symbol = symbol_short!("RWD_EN");
 const REWARD_PER_SHARE_KEY: Symbol = symbol_short!("RWD_PSH");
 const REWARD_POOL_KEY: Symbol = symbol_short!("RWD_POOL");
 const UNALLOCATED_REWARDS_KEY: Symbol = symbol_short!("RWD_UNA");
@@ -45,6 +47,7 @@ const TOPIC_ADMIN_CANCELLED: Symbol = symbol_short!("AD_CANC");
 const TOPIC_REWARDS_DEPOSITED: Symbol = symbol_short!("RWD_DEP");
 const TOPIC_REWARDS_CLAIMED: Symbol = symbol_short!("RWD_CLM");
 const TOPIC_COMPOUNDED: Symbol = symbol_short!("CMPND");
+const TOPIC_CONFIG_UPDATED: Symbol = symbol_short!("CFG_UP");
 
 // ── Error codes ───────────────────────────────────────────────────────────────
 
@@ -69,6 +72,8 @@ pub enum StakingError {
     StillLocked = 15,
     InsufficientBalance = 16,
     NothingToCompound = 17,
+    BelowMinStake = 18,
+    ExceedsMaxStake = 19,
 }
 
 // ── Storage key schema ────────────────────────────────────────────────────────
@@ -76,6 +81,7 @@ pub enum StakingError {
 #[contracttype]
 #[derive(Clone)]
 enum DataKey {
+    Stake(Address),
     Position(Address),
     HostLock(Address, u64),
     HostLockedTotal(Address),
@@ -83,6 +89,24 @@ enum DataKey {
     PendingRewards(Address),
     StakedAt(Address),
     TotalClaimedRewards(Address),
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StakerBalance {
+    pub amount: i128,
+    pub staked_at: u64,
+    pub last_reward_snapshot: i128,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StakingConfig {
+    pub token_address: Address,
+    pub min_stake: i128,
+    pub lock_period_seconds: u64,
+    pub max_stake_per_address: i128,
+    pub rewards_enabled: bool,
 }
 
 // ── Types ─────────────────────────────────────────────────────────────────────
@@ -132,6 +156,10 @@ impl StakingContract {
         env.storage().instance().set(&TOKEN_KEY, &token);
         env.storage().instance().set(&LOCK_PERIOD_KEY, &0u64);
         env.storage().instance().set(&MIN_STAKE_KEY, &1i128);
+        env.storage()
+            .instance()
+            .set(&MAX_STAKE_KEY, &i128::MAX);
+        env.storage().instance().set(&REWARDS_ENABLED_KEY, &true);
         env.storage().instance().set(&REWARD_PER_SHARE_KEY, &0i128);
         env.storage().instance().set(&REWARD_POOL_KEY, &0i128);
         env.storage()
@@ -188,6 +216,44 @@ impl StakingContract {
 
     pub fn min_stake(env: Env) -> i128 {
         env.storage().instance().get(&MIN_STAKE_KEY).unwrap_or(1)
+    }
+
+    pub fn get_config(env: Env) -> StakingConfig {
+        StakingConfig {
+            token_address: Self::token(env.clone()),
+            min_stake: Self::min_stake(env.clone()),
+            lock_period_seconds: Self::lock_period_seconds(env.clone()),
+            max_stake_per_address: env.storage().instance().get(&MAX_STAKE_KEY).unwrap_or(i128::MAX),
+            rewards_enabled: env
+                .storage()
+                .instance()
+                .get(&REWARDS_ENABLED_KEY)
+                .unwrap_or(true),
+        }
+    }
+
+    pub fn update_config(env: Env, config: StakingConfig) -> Result<(), StakingError> {
+        let admin = Self::admin(env.clone());
+        admin.require_auth();
+        if config.min_stake <= 0 {
+            return Err(StakingError::InvalidAmount);
+        }
+        if config.max_stake_per_address < config.min_stake {
+            return Err(StakingError::InvalidAmount);
+        }
+        env.storage().instance().set(&TOKEN_KEY, &config.token_address);
+        env.storage().instance().set(&MIN_STAKE_KEY, &config.min_stake);
+        env.storage()
+            .instance()
+            .set(&LOCK_PERIOD_KEY, &config.lock_period_seconds);
+        env.storage()
+            .instance()
+            .set(&MAX_STAKE_KEY, &config.max_stake_per_address);
+        env.storage()
+            .instance()
+            .set(&REWARDS_ENABLED_KEY, &config.rewards_enabled);
+        env.events().publish((TOPIC_CONFIG_UPDATED,), (EVENT_VERSION, config));
+        Ok(())
     }
 
     // ── Pause mechanism ──────────────────────────────────────────────────────
@@ -368,6 +434,10 @@ impl StakingContract {
         if amount <= 0 {
             return Err(StakingError::InvalidAmount);
         }
+        let min_stake = Self::min_stake(env.clone());
+        if amount < min_stake {
+            return Err(StakingError::BelowMinStake);
+        }
 
         let token_contract = get_token_contract(&env)?;
 
@@ -383,6 +453,14 @@ impl StakingContract {
 
         let total_staked: i128 = env.storage().instance().get(&TOTAL_STAKED_KEY).unwrap_or(0);
         let total_shares: i128 = env.storage().instance().get(&TOTAL_SHARES_KEY).unwrap_or(0);
+        let max_stake: i128 = env.storage().instance().get(&MAX_STAKE_KEY).unwrap_or(i128::MAX);
+        let new_balance = position
+            .amount
+            .checked_add(amount)
+            .ok_or(StakingError::InvalidAmount)?;
+        if new_balance > max_stake {
+            return Err(StakingError::ExceedsMaxStake);
+        }
 
         let shares_minted = if total_staked == 0 || total_shares == 0 {
             amount
@@ -400,7 +478,7 @@ impl StakingContract {
         env.storage()
             .instance()
             .set(&TOTAL_SHARES_KEY, &(total_shares + shares_minted));
-        position.amount += amount;
+        position.amount = new_balance;
         position.shares += shares_minted;
         env.storage()
             .persistent()
@@ -408,6 +486,19 @@ impl StakingContract {
         env.storage().persistent().set(
             &DataKey::StakedAt(staker.clone()),
             &env.ledger().timestamp(),
+        );
+        let reward_snapshot: i128 = env
+            .storage()
+            .instance()
+            .get(&REWARD_PER_SHARE_KEY)
+            .unwrap_or(0);
+        env.storage().persistent().set(
+            &DataKey::Stake(staker.clone()),
+            &StakerBalance {
+                amount: new_balance,
+                staked_at: env.ledger().timestamp(),
+                last_reward_snapshot: reward_snapshot,
+            },
         );
         sync_reward_debt(&env, &staker)?;
         distribute_unallocated_rewards(&env)?;
@@ -420,7 +511,7 @@ impl StakingContract {
         );
 
         env.events()
-            .publish((TOPIC_STAKE,), (staker, amount, shares_minted));
+            .publish((TOPIC_STAKE,), (staker, amount, total_staked + amount));
 
         Ok(shares_minted)
     }

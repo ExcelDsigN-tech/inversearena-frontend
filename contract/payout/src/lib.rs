@@ -68,6 +68,16 @@ pub enum DataKey {
 }
 
 #[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FactoryArenaMetadata {
+    pub pool_id: u32,
+    pub creator: Address,
+    pub capacity: u32,
+    pub stake_amount: i128,
+    pub win_fee_bps: u32,
+}
+
+#[contracttype]
 #[derive(Clone, Debug)]
 pub struct PayoutData {
     pub winner: Address,
@@ -128,6 +138,7 @@ pub enum PayoutError {
     AdminTransferExpired = 13,
     Unauthorized = 14,
     RecoveryAmountInvalid = 15,
+    ArithmeticOverflow = 16,
 }
 
 #[contract]
@@ -268,14 +279,26 @@ impl PayoutContract {
         let mut fee_amount: i128 = 0;
         let mut winner_amount: i128 = amount;
 
-        let fee_bps: u32 = env.invoke_contract(
+        let arena_meta: Option<FactoryArenaMetadata> = env.invoke_contract(
             &factory,
-            &soroban_sdk::Symbol::new(&env, "current_fee_bps"),
-            soroban_sdk::vec![&env],
+            &soroban_sdk::Symbol::new(&env, "get_arena"),
+            soroban_sdk::vec![&env, pool_id.into_val(&env)],
         );
+        let fee_bps = arena_meta.map(|m| m.win_fee_bps).unwrap_or_else(|| {
+            env.invoke_contract(
+                &factory,
+                &soroban_sdk::Symbol::new(&env, "current_fee_bps"),
+                soroban_sdk::vec![&env],
+            )
+        });
         if fee_bps > 0 {
-            fee_amount = amount.saturating_mul(fee_bps as i128) / 10_000i128;
-            winner_amount = amount.saturating_sub(fee_amount);
+            fee_amount = amount
+                .checked_mul(fee_bps as i128)
+                .and_then(|v| v.checked_div(10_000i128))
+                .ok_or(PayoutError::ArithmeticOverflow)?;
+            winner_amount = amount
+                .checked_sub(fee_amount)
+                .ok_or(PayoutError::ArithmeticOverflow)?;
         }
 
         // Transfer tokens to winner and fee treasury if token address exists.
@@ -290,11 +313,15 @@ impl PayoutContract {
                 &winner_amount,
             );
             if fee_amount > 0 {
-                let treasury = Self::treasury(env.clone())?;
                 token::Client::new(&env, &token_address).transfer(
                     &env.current_contract_address(),
-                    &treasury,
+                    &factory,
                     &fee_amount,
+                );
+                env.invoke_contract::<()>(
+                    &factory,
+                    &soroban_sdk::Symbol::new(&env, "record_win_fee"),
+                    soroban_sdk::vec![&env, fee_amount.into_val(&env)],
                 );
             }
         }

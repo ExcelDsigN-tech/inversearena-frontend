@@ -24,16 +24,23 @@ use soroban_sdk::IntoVal;
 /// The primary (and fallback) vault is expected to expose:
 /// - `deposit(token: Address, amount: i128) -> i128`  — returns shares minted.
 /// - `withdraw(shares: i128) -> i128`                 — burns shares, returns tokens.
-pub struct RwaVaultAdapter;
+pub trait RwaVaultAdapter {
+    fn deposit(env: &soroban_sdk::Env, amount: i128, vault_address: soroban_sdk::Address) -> i128;
+    fn withdraw(
+        env: &soroban_sdk::Env,
+        shares: i128,
+        vault_address: soroban_sdk::Address,
+    ) -> i128;
+    fn get_balance(env: &soroban_sdk::Env, vault_address: soroban_sdk::Address) -> i128;
+}
+
+pub struct OndoUsdyAdapter;
 
 use soroban_sdk::IntoVal;
 
-impl RwaVaultAdapter {
-    /// Call `vault.deposit(token, amount)` and return the shares minted.
-    ///
-    /// The caller must have already transferred `amount` tokens to `vault`
-    /// before calling this, or the vault must pull them via an approval.
-    pub fn deposit(
+impl OndoUsdyAdapter {
+    /// Backward compatible helper used by existing call sites.
+    pub fn deposit_with_token(
         env: &soroban_sdk::Env,
         vault: &soroban_sdk::Address,
         token: soroban_sdk::Address,
@@ -45,13 +52,34 @@ impl RwaVaultAdapter {
             soroban_sdk::vec![env, token.into_val(env), amount.into_val(env)],
         )
     }
+}
 
-    /// Call `vault.withdraw(shares)` and return the tokens received.
-    pub fn withdraw(env: &soroban_sdk::Env, vault: &soroban_sdk::Address, shares: i128) -> i128 {
+impl RwaVaultAdapter for OndoUsdyAdapter {
+    fn deposit(env: &soroban_sdk::Env, amount: i128, vault_address: soroban_sdk::Address) -> i128 {
         env.invoke_contract(
-            vault,
+            &vault_address,
+            &soroban_sdk::Symbol::new(env, "deposit"),
+            soroban_sdk::vec![env, amount.into_val(env)],
+        )
+    }
+
+    fn withdraw(
+        env: &soroban_sdk::Env,
+        shares: i128,
+        vault_address: soroban_sdk::Address,
+    ) -> i128 {
+        env.invoke_contract(
+            &vault_address,
             &soroban_sdk::Symbol::new(env, "withdraw"),
             soroban_sdk::vec![env, shares.into_val(env)],
+        )
+    }
+
+    fn get_balance(env: &soroban_sdk::Env, vault_address: soroban_sdk::Address) -> i128 {
+        env.invoke_contract(
+            &vault_address,
+            &soroban_sdk::Symbol::new(env, "get_balance"),
+            soroban_sdk::vec![env],
         )
     }
 }

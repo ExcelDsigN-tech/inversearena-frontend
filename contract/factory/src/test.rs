@@ -1572,7 +1572,7 @@ fn fee_double_propose_returns_fee_already_pending() {
 fn fee_propose_exceeding_max_returns_fee_too_high() {
     let (_env, _admin, client) = setup();
     assert_eq!(
-        client.try_propose_fee_update(&2_001u32),
+        client.try_propose_fee_update(&1_001u32),
         Err(Ok(Error::FeeTooHigh))
     );
 }
@@ -1580,7 +1580,7 @@ fn fee_propose_exceeding_max_returns_fee_too_high() {
 #[test]
 fn fee_propose_at_max_succeeds() {
     let (_env, _admin, client) = setup();
-    assert!(client.try_propose_fee_update(&2_000u32).is_ok());
+    assert!(client.try_propose_fee_update(&1_000u32).is_ok());
 }
 
 #[test]
@@ -1766,4 +1766,21 @@ fn create_pool_fails_if_host_balance_below_creation_fee_and_transfers_when_suffi
     let after_factory_bal = fee_token_client.balance(&factory_addr);
     assert_eq!(after_factory_bal, before_factory_bal + creation_fee);
     let _ = ok;
+}
+
+#[test]
+fn fee_config_rejects_win_fee_above_1000_bps() {
+    let (env, _admin, client) = setup();
+    let token_admin = Address::generate(&env);
+    let fee_token = env
+        .register_stellar_asset_contract_v2(token_admin)
+        .address();
+    let cfg = FeeConfig {
+        creation_fee: 1_000_000,
+        win_fee_bps: 1001,
+    };
+    assert_eq!(
+        client.try_set_fee_config(&cfg, &fee_token),
+        Err(Ok(Error::FeeTooHigh))
+    );
 }

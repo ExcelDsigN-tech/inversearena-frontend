@@ -37,6 +37,7 @@ const FEE_AFTER_KEY: Symbol = symbol_short!("F_AFTER");
 const CREATION_FEE_KEY: Symbol = symbol_short!("CR_FEE");
 const CREATION_TOKEN_KEY: Symbol = symbol_short!("CR_TOK");
 const CREATION_FEE_ACCUM_KEY: Symbol = symbol_short!("CR_ACC");
+const WIN_FEE_ACCUM_KEY: Symbol = symbol_short!("WIN_ACC");
 
 /// Current schema version. Bump this when storage layout changes.
 const CURRENT_SCHEMA_VERSION: u32 = 1;
@@ -47,7 +48,7 @@ const FEE_TIMELOCK_PERIOD: u64 = 24 * 60 * 60;
 /// Default platform win fee: 2% (200 basis points).
 pub const DEFAULT_WIN_FEE_BPS: u32 = 200;
 /// Maximum allowed win fee: 20% (2000 basis points).
-pub const MAX_WIN_FEE_BPS: u32 = 2_000;
+pub const MAX_WIN_FEE_BPS: u32 = 1_000;
 
 #[contracttype]
 #[derive(Clone, Debug, PartialEq)]
@@ -59,6 +60,13 @@ pub struct ArenaMetadata {
     /// Platform win fee in basis points, snapshotted at arena creation time.
     /// Payout uses this value, not the current global fee, so fee changes
     /// cannot retroactively affect active arenas.
+    pub win_fee_bps: u32,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct FeeConfig {
+    pub creation_fee: i128,
     pub win_fee_bps: u32,
 }
 
@@ -170,6 +178,7 @@ const TOPIC_FEE_EXECUTED: Symbol = symbol_short!("FEE_EX");
 const TOPIC_FEE_CANCELLED: Symbol = symbol_short!("FEE_CAN");
 const TOPIC_FEE_CONFIG_UPDATED: Symbol = symbol_short!("CRF_UP");
 const TOPIC_ARENA_CREATED: Symbol = symbol_short!("ARNA_CRE");
+const TOPIC_FEES_WITHDRAWN: Symbol = symbol_short!("FEE_WD");
 
 /// Event payload version. Include in every event data tuple so consumers
 /// can detect schema changes without re-deploying indexers.
@@ -225,7 +234,7 @@ pub enum Error {
     FeeAlreadyPending = 19,
     /// `execute_fee_update` or `cancel_fee_update` with no pending fee update.
     NoPendingFeeUpdate = 20,
-    /// Provided fee exceeds `MAX_WIN_FEE_BPS` (2000).
+    /// Provided fee exceeds `MAX_WIN_FEE_BPS` (1000).
     FeeTooHigh = 21,
     /// Creation fee amount is negative.
     InvalidCreationFee = 22,
@@ -249,6 +258,8 @@ pub enum Error {
     StakingContractNotSet = 31,
     /// Host staked balance below configured minimum host stake.
     HostStakeInsufficient = 32,
+    /// Arithmetic overflow in fee calculation/accumulation.
+    ArithmeticOverflow = 33,
 }
 
 // ── Contract ──────────────────────────────────────────────────────────────────
@@ -291,6 +302,7 @@ impl FactoryContract {
         env.storage()
             .instance()
             .set(&CREATION_FEE_ACCUM_KEY, &0i128);
+        env.storage().instance().set(&WIN_FEE_ACCUM_KEY, &0i128);
         env.storage()
             .instance()
             .set(&SCHEMA_VERSION_KEY, &CURRENT_SCHEMA_VERSION);
@@ -656,6 +668,80 @@ impl FactoryContract {
             (EVENT_VERSION, old_fee, amount, token),
         );
         Ok(())
+    }
+
+    /// Admin-only: update both creation fee and win fee config in one call.
+    pub fn set_fee_config(env: Env, config: FeeConfig, token: Address) -> Result<(), Error> {
+        let admin = require_admin(&env)?;
+        admin.require_auth();
+        if config.creation_fee < 0 {
+            return Err(Error::InvalidCreationFee);
+        }
+        if config.win_fee_bps > MAX_WIN_FEE_BPS {
+            return Err(Error::FeeTooHigh);
+        }
+        env.storage()
+            .instance()
+            .set(&CREATION_FEE_KEY, &config.creation_fee);
+        env.storage().instance().set(&CREATION_TOKEN_KEY, &token);
+        env.storage()
+            .instance()
+            .set(&WIN_FEE_BPS_KEY, &config.win_fee_bps);
+        Ok(())
+    }
+
+    /// Read full fee config.
+    pub fn get_fee_config(env: Env) -> FeeConfig {
+        FeeConfig {
+            creation_fee: env
+                .storage()
+                .instance()
+                .get(&CREATION_FEE_KEY)
+                .unwrap_or(0i128),
+            win_fee_bps: Self::current_fee_bps(env),
+        }
+    }
+
+    /// Called by payout contract to record collected win fees.
+    pub fn record_win_fee(env: Env, amount: i128) -> Result<(), Error> {
+        if amount <= 0 {
+            return Ok(());
+        }
+        let current: i128 = env.storage().instance().get(&WIN_FEE_ACCUM_KEY).unwrap_or(0i128);
+        let next = current
+            .checked_add(amount)
+            .ok_or(Error::ArithmeticOverflow)?;
+        env.storage().instance().set(&WIN_FEE_ACCUM_KEY, &next);
+        Ok(())
+    }
+
+    /// Admin-only treasury withdrawal for all accumulated protocol fees.
+    pub fn admin_withdraw_fees(env: Env, to: Address) -> Result<i128, Error> {
+        let admin = require_admin(&env)?;
+        admin.require_auth();
+        let creation_fee_accum: i128 = env
+            .storage()
+            .instance()
+            .get(&CREATION_FEE_ACCUM_KEY)
+            .unwrap_or(0i128);
+        let win_fee_accum: i128 = env.storage().instance().get(&WIN_FEE_ACCUM_KEY).unwrap_or(0i128);
+        let total = creation_fee_accum
+            .checked_add(win_fee_accum)
+            .ok_or(Error::ArithmeticOverflow)?;
+        if total <= 0 {
+            return Ok(0);
+        }
+        let token: Address = env
+            .storage()
+            .instance()
+            .get(&CREATION_TOKEN_KEY)
+            .unwrap_or(env.current_contract_address());
+        token::Client::new(&env, &token).transfer(&env.current_contract_address(), &to, &total);
+        env.storage().instance().set(&CREATION_FEE_ACCUM_KEY, &0i128);
+        env.storage().instance().set(&WIN_FEE_ACCUM_KEY, &0i128);
+        env.events()
+            .publish((TOPIC_FEES_WITHDRAWN,), (EVENT_VERSION, total, to));
+        Ok(total)
     }
 
     /// Public read: get the configured (creation_fee, fee_token).
