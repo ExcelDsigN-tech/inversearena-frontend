@@ -72,16 +72,32 @@ fn test_double_initialize_returns_already_initialized() {
 
 /// Helper: inject an ArenaRef with a known host into factory storage.
 fn inject_arena_ref(env: &Env, contract_id: &Address, arena_id: u64, host: &Address) {
+    inject_arena_ref_with_status(env, contract_id, arena_id, host, ArenaStatus::Pending);
+}
+
+fn inject_arena_ref_with_status(
+    env: &Env,
+    contract_id: &Address,
+    arena_id: u64,
+    host: &Address,
+    status: ArenaStatus,
+) {
     let fake_contract = Address::generate(env);
     env.as_contract(contract_id, || {
         env.storage().persistent().set(
             &DataKey::ArenaRef(arena_id),
             &ArenaRef {
                 contract: fake_contract,
-                status: ArenaStatus::Pending,
+                status,
                 host: host.clone(),
             },
         );
+    });
+}
+
+fn set_pool_count(env: &Env, contract_id: &Address, pool_count: u32) {
+    env.as_contract(contract_id, || {
+        env.storage().instance().set(&POOL_COUNT_KEY, &pool_count);
     });
 }
 
@@ -552,6 +568,67 @@ fn create_pool_metadata_not_visible_before_full_init() {
 
     assert!(client.get_arena(&0u32).is_none());
     assert_eq!(client.get_arenas(&0u32, &10u32).len(), 0);
+}
+
+#[test]
+fn create_pool_rejects_past_join_deadline() {
+    let (env, admin, client) = setup();
+    client.set_arena_wasm_hash(&dummy_hash(&env));
+    let currency = supported_currency(&env, &client);
+
+    let result = client.try_create_pool(
+        &admin,
+        &MIN_STAKE,
+        &currency,
+        &10u32,
+        &8u32,
+        &env.ledger().timestamp().saturating_sub(1),
+    );
+
+    assert!(result.is_err(), "past join deadlines must be rejected");
+    assert!(client.get_arena(&0u32).is_none());
+}
+
+#[test]
+fn create_pool_rejects_join_deadline_that_is_too_close() {
+    let (env, admin, client) = setup();
+    client.set_arena_wasm_hash(&dummy_hash(&env));
+    let currency = supported_currency(&env, &client);
+
+    let result = client.try_create_pool(
+        &admin,
+        &MIN_STAKE,
+        &currency,
+        &10u32,
+        &8u32,
+        &(env.ledger().timestamp() + 3599),
+    );
+
+    assert!(result.is_err(), "join deadlines under one hour out must be rejected");
+    assert!(client.get_arena(&0u32).is_none());
+}
+
+#[test]
+fn create_pool_accepts_join_deadline_at_factory_boundary() {
+    let (env, admin, client) = setup();
+    client.set_arena_wasm_hash(&dummy_hash(&env));
+    let currency = supported_currency(&env, &client);
+    let join_deadline = env.ledger().timestamp() + 3600;
+
+    let arena_addr = client.create_pool(
+        &admin,
+        &MIN_STAKE,
+        &currency,
+        &10u32,
+        &8u32,
+        &join_deadline,
+    );
+
+    let metadata = client.get_arena(&0u32).expect("metadata must only exist after success");
+    assert_eq!(metadata.pool_id, 0);
+
+    let arena = ArenaContractClient::new(&env, &arena_addr);
+    assert_eq!(arena.get_join_deadline(), join_deadline);
 }
 
 // ── propose_upgrade ───────────────────────────────────────────────────────────
@@ -1067,6 +1144,46 @@ fn test_get_arenas_pagination() {
     let page3 = client.get_arenas(&4u32, &2u32);
     assert_eq!(page3.len(), 1);
     assert_eq!(page3.get(0).unwrap().pool_id, 4);
+}
+
+#[test]
+fn list_arenas_pagination_skips_sparse_entries_stably() {
+    let (env, _admin, client) = setup();
+    let host = Address::generate(&env);
+    set_pool_count(&env, &client.address, 6);
+    inject_arena_ref(&env, &client.address, 0, &host);
+    inject_arena_ref(&env, &client.address, 2, &host);
+    inject_arena_ref(&env, &client.address, 5, &host);
+
+    let page1 = client.list_arenas(&Option::<u64>::None, &2u32);
+    assert_eq!(page1.items.len(), 2);
+    assert_eq!(page1.items.get(0).unwrap().arena_id, 0);
+    assert_eq!(page1.items.get(1).unwrap().arena_id, 2);
+    assert_eq!(page1.next_cursor, Some(2));
+    assert!(page1.has_more);
+
+    let page2 = client.list_arenas(&Some(2u64), &2u32);
+    assert_eq!(page2.items.len(), 1);
+    assert_eq!(page2.items.get(0).unwrap().arena_id, 5);
+    assert_eq!(page2.next_cursor, None);
+    assert!(!page2.has_more);
+}
+
+#[test]
+fn list_arenas_cursor_can_resume_after_missing_id() {
+    let (env, _admin, client) = setup();
+    let host = Address::generate(&env);
+    set_pool_count(&env, &client.address, 8);
+    inject_arena_ref(&env, &client.address, 1, &host);
+    inject_arena_ref_with_status(&env, &client.address, 4, &host, ArenaStatus::Active);
+    inject_arena_ref(&env, &client.address, 7, &host);
+
+    let page = client.list_arenas(&Some(2u64), &2u32);
+    assert_eq!(page.items.len(), 2);
+    assert_eq!(page.items.get(0).unwrap().arena_id, 4);
+    assert_eq!(page.items.get(1).unwrap().arena_id, 7);
+    assert_eq!(page.next_cursor, None);
+    assert!(!page.has_more);
 }
 
 // ── Schema versioning tests ──────────────────────────────────────────────────

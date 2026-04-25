@@ -4,6 +4,13 @@ use soroban_sdk::{
     Address, BytesN, Env, IntoVal, String, Symbol, Vec, contract, contracterror, contractimpl,
     contracttype, symbol_short, token, xdr::ToXdr,
 };
+#[path = "../../shared/upgrade.rs"]
+mod upgrade_utils;
+use upgrade_utils::{
+    ExecuteTimePolicy, UpgradeErrors, UpgradeKeys, UpgradeTopics, cancel_upgrade as cancel_upgrade_flow,
+    execute_upgrade as execute_upgrade_flow, pending_upgrade as pending_upgrade_flow,
+    propose_upgrade as propose_upgrade_flow,
+};
 
 #[cfg(test)]
 use arena::ArenaContract; 
@@ -1289,24 +1296,22 @@ impl FactoryContract {
     pub fn propose_upgrade(env: Env, new_wasm_hash: BytesN<32>) -> Result<(), Error> {
         let admin = require_admin(&env)?;
         admin.require_auth();
-
-        if env.storage().instance().has(&PENDING_HASH_KEY) {
-            return Err(Error::UpgradeAlreadyPending);
-        }
-
-        let execute_after: u64 = env.ledger().timestamp() + TIMELOCK_PERIOD;
-        env.storage()
-            .instance()
-            .set(&PENDING_HASH_KEY, &new_wasm_hash);
-        env.storage()
-            .instance()
-            .set(&EXECUTE_AFTER_KEY, &execute_after);
-
-        env.events().publish(
-            (TOPIC_UPGRADE_PROPOSED,),
-            (EVENT_VERSION, new_wasm_hash, execute_after),
-        );
-        Ok(())
+        propose_upgrade_flow(
+            &env,
+            UpgradeKeys {
+                pending_hash: &PENDING_HASH_KEY,
+                execute_after: &EXECUTE_AFTER_KEY,
+            },
+            UpgradeTopics {
+                proposed: &TOPIC_UPGRADE_PROPOSED,
+                executed: &TOPIC_UPGRADE_EXECUTED,
+                cancelled: &TOPIC_UPGRADE_CANCELLED,
+            },
+            EVENT_VERSION,
+            TIMELOCK_PERIOD,
+            &new_wasm_hash,
+            Error::UpgradeAlreadyPending,
+        )
     }
 
     /// Execute a previously proposed upgrade after the 48-hour timelock.
@@ -1327,44 +1332,27 @@ impl FactoryContract {
     pub fn execute_upgrade(env: Env, expected_hash: BytesN<32>) -> Result<(), Error> {
         let admin = require_admin(&env)?;
         admin.require_auth();
-
-        let has_pending_hash = env.storage().instance().has(&PENDING_HASH_KEY);
-        let has_execute_after = env.storage().instance().has(&EXECUTE_AFTER_KEY);
-        match (has_pending_hash, has_execute_after) {
-            (false, false) => return Err(Error::NoPendingUpgrade),
-            (true, false) | (false, true) => return Err(Error::MalformedUpgradeState),
-            (true, true) => {}
-        }
-
-        let execute_after: u64 = env
-            .storage()
-            .instance()
-            .get(&EXECUTE_AFTER_KEY)
-            .ok_or(Error::MalformedUpgradeState)?;
-
-        if env.ledger().timestamp() < execute_after {
-            return Err(Error::TimelockNotExpired);
-        }
-
-        let stored_hash: BytesN<32> = env
-            .storage()
-            .instance()
-            .get(&PENDING_HASH_KEY)
-            .ok_or(Error::MalformedUpgradeState)?;
-
-        if stored_hash != expected_hash {
-            return Err(Error::HashMismatch);
-        }
-
-        // Clear pending state before upgrading.
-        env.storage().instance().remove(&PENDING_HASH_KEY);
-        env.storage().instance().remove(&EXECUTE_AFTER_KEY);
-
-        env.events().publish(
-            (TOPIC_UPGRADE_EXECUTED,),
-            (EVENT_VERSION, stored_hash.clone()),
-        );
-
+        let stored_hash = execute_upgrade_flow(
+            &env,
+            UpgradeKeys {
+                pending_hash: &PENDING_HASH_KEY,
+                execute_after: &EXECUTE_AFTER_KEY,
+            },
+            UpgradeTopics {
+                proposed: &TOPIC_UPGRADE_PROPOSED,
+                executed: &TOPIC_UPGRADE_EXECUTED,
+                cancelled: &TOPIC_UPGRADE_CANCELLED,
+            },
+            EVENT_VERSION,
+            &expected_hash,
+            UpgradeErrors {
+                no_pending: Error::NoPendingUpgrade,
+                timelock_not_expired: Error::TimelockNotExpired,
+                hash_mismatch: Error::HashMismatch,
+                malformed_state: Some(Error::MalformedUpgradeState),
+            },
+            ExecuteTimePolicy::AtOrAfter,
+        )?;
         env.deployer().update_current_contract_wasm(stored_hash);
         Ok(())
     }
@@ -1386,17 +1374,20 @@ impl FactoryContract {
     pub fn cancel_upgrade(env: Env) -> Result<(), Error> {
         let admin = require_admin(&env)?;
         admin.require_auth();
-
-        if !env.storage().instance().has(&PENDING_HASH_KEY) {
-            return Err(Error::NoPendingUpgrade);
-        }
-
-        env.storage().instance().remove(&PENDING_HASH_KEY);
-        env.storage().instance().remove(&EXECUTE_AFTER_KEY);
-
-        env.events()
-            .publish((TOPIC_UPGRADE_CANCELLED,), (EVENT_VERSION,));
-        Ok(())
+        cancel_upgrade_flow(
+            &env,
+            UpgradeKeys {
+                pending_hash: &PENDING_HASH_KEY,
+                execute_after: &EXECUTE_AFTER_KEY,
+            },
+            UpgradeTopics {
+                proposed: &TOPIC_UPGRADE_PROPOSED,
+                executed: &TOPIC_UPGRADE_EXECUTED,
+                cancelled: &TOPIC_UPGRADE_CANCELLED,
+            },
+            EVENT_VERSION,
+            Error::NoPendingUpgrade,
+        )
     }
 
     /// Return the pending WASM hash and the earliest execution timestamp,
@@ -1405,12 +1396,13 @@ impl FactoryContract {
     /// # Authorization
     /// None — read-only, open to any caller.
     pub fn pending_upgrade(env: Env) -> Option<(BytesN<32>, u64)> {
-        let hash: Option<BytesN<32>> = env.storage().instance().get(&PENDING_HASH_KEY);
-        let after: Option<u64> = env.storage().instance().get(&EXECUTE_AFTER_KEY);
-        match (hash, after) {
-            (Some(h), Some(a)) => Some((h, a)),
-            _ => None,
-        }
+        pending_upgrade_flow(
+            &env,
+            UpgradeKeys {
+                pending_hash: &PENDING_HASH_KEY,
+                execute_after: &EXECUTE_AFTER_KEY,
+            },
+        )
     }
 
     /// Get metadata for a specific pool.

@@ -4,6 +4,13 @@ use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, panic_with_error, symbol_short, token,
     Address, BytesN, Env, IntoVal, Symbol, Vec,
 };
+#[path = "../../shared/upgrade.rs"]
+mod upgrade_utils;
+use upgrade_utils::{
+    ExecuteTimePolicy, UpgradeErrors, UpgradeKeys, UpgradeTopics, cancel_upgrade as cancel_upgrade_flow,
+    execute_upgrade as execute_upgrade_flow, pending_upgrade as pending_upgrade_flow,
+    propose_upgrade as propose_upgrade_flow,
+};
 
 const ADMIN_KEY: Symbol = symbol_short!("ADMIN");
 const PENDING_ADMIN_KEY: Symbol = symbol_short!("P_ADMIN");
@@ -575,48 +582,48 @@ impl PayoutContract {
     pub fn propose_upgrade(env: Env, new_wasm_hash: BytesN<32>) -> Result<(), PayoutError> {
         let admin = Self::admin(env.clone());
         admin.require_auth();
-        if env.storage().instance().has(&PENDING_HASH_KEY) {
-            return Err(PayoutError::UpgradeAlreadyPending);
-        }
-        let execute_after: u64 = env.ledger().timestamp() + TIMELOCK_PERIOD;
-        env.storage()
-            .instance()
-            .set(&PENDING_HASH_KEY, &new_wasm_hash);
-        env.storage()
-            .instance()
-            .set(&EXECUTE_AFTER_KEY, &execute_after);
-        env.events().publish(
-            (TOPIC_UPGRADE_PROPOSED,),
-            (EVENT_VERSION, new_wasm_hash, execute_after),
-        );
-        Ok(())
+        propose_upgrade_flow(
+            &env,
+            UpgradeKeys {
+                pending_hash: &PENDING_HASH_KEY,
+                execute_after: &EXECUTE_AFTER_KEY,
+            },
+            UpgradeTopics {
+                proposed: &TOPIC_UPGRADE_PROPOSED,
+                executed: &TOPIC_UPGRADE_EXECUTED,
+                cancelled: &TOPIC_UPGRADE_CANCELLED,
+            },
+            EVENT_VERSION,
+            TIMELOCK_PERIOD,
+            &new_wasm_hash,
+            PayoutError::UpgradeAlreadyPending,
+        )
     }
 
     pub fn execute_upgrade(env: Env, expected_hash: BytesN<32>) -> Result<(), PayoutError> {
         let admin = Self::admin(env.clone());
         admin.require_auth();
-        let execute_after: u64 = env
-            .storage()
-            .instance()
-            .get(&EXECUTE_AFTER_KEY)
-            .ok_or(PayoutError::NoPendingUpgrade)?;
-        if env.ledger().timestamp() < execute_after {
-            return Err(PayoutError::TimelockNotExpired);
-        }
-        let stored_hash: BytesN<32> = env
-            .storage()
-            .instance()
-            .get(&PENDING_HASH_KEY)
-            .ok_or(PayoutError::NoPendingUpgrade)?;
-        if stored_hash != expected_hash {
-            return Err(PayoutError::HashMismatch);
-        }
-        env.storage().instance().remove(&PENDING_HASH_KEY);
-        env.storage().instance().remove(&EXECUTE_AFTER_KEY);
-        env.events().publish(
-            (TOPIC_UPGRADE_EXECUTED,),
-            (EVENT_VERSION, stored_hash.clone()),
-        );
+        let stored_hash = execute_upgrade_flow(
+            &env,
+            UpgradeKeys {
+                pending_hash: &PENDING_HASH_KEY,
+                execute_after: &EXECUTE_AFTER_KEY,
+            },
+            UpgradeTopics {
+                proposed: &TOPIC_UPGRADE_PROPOSED,
+                executed: &TOPIC_UPGRADE_EXECUTED,
+                cancelled: &TOPIC_UPGRADE_CANCELLED,
+            },
+            EVENT_VERSION,
+            &expected_hash,
+            UpgradeErrors {
+                no_pending: PayoutError::NoPendingUpgrade,
+                timelock_not_expired: PayoutError::TimelockNotExpired,
+                hash_mismatch: PayoutError::HashMismatch,
+                malformed_state: None,
+            },
+            ExecuteTimePolicy::AtOrAfter,
+        )?;
         env.deployer().update_current_contract_wasm(stored_hash);
         Ok(())
     }
@@ -624,23 +631,30 @@ impl PayoutContract {
     pub fn cancel_upgrade(env: Env) -> Result<(), PayoutError> {
         let admin = Self::admin(env.clone());
         admin.require_auth();
-        if !env.storage().instance().has(&PENDING_HASH_KEY) {
-            return Err(PayoutError::NoPendingUpgrade);
-        }
-        env.storage().instance().remove(&PENDING_HASH_KEY);
-        env.storage().instance().remove(&EXECUTE_AFTER_KEY);
-        env.events()
-            .publish((TOPIC_UPGRADE_CANCELLED,), (EVENT_VERSION,));
-        Ok(())
+        cancel_upgrade_flow(
+            &env,
+            UpgradeKeys {
+                pending_hash: &PENDING_HASH_KEY,
+                execute_after: &EXECUTE_AFTER_KEY,
+            },
+            UpgradeTopics {
+                proposed: &TOPIC_UPGRADE_PROPOSED,
+                executed: &TOPIC_UPGRADE_EXECUTED,
+                cancelled: &TOPIC_UPGRADE_CANCELLED,
+            },
+            EVENT_VERSION,
+            PayoutError::NoPendingUpgrade,
+        )
     }
 
     pub fn pending_upgrade(env: Env) -> Option<(BytesN<32>, u64)> {
-        let hash: Option<BytesN<32>> = env.storage().instance().get(&PENDING_HASH_KEY);
-        let after: Option<u64> = env.storage().instance().get(&EXECUTE_AFTER_KEY);
-        match (hash, after) {
-            (Some(h), Some(a)) => Some((h, a)),
-            _ => None,
-        }
+        pending_upgrade_flow(
+            &env,
+            UpgradeKeys {
+                pending_hash: &PENDING_HASH_KEY,
+                execute_after: &EXECUTE_AFTER_KEY,
+            },
+        )
     }
 
     /// Admin-only recovery endpoint for stranded tokens.

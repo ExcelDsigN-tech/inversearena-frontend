@@ -1,16 +1,17 @@
 # Soroban Contract Data Model
 
-This document describes the current on-chain data model for the Soroban workspace in `contract/`.
+This document describes the storage layout and TTL policy for the contracts in
+`contract/`.
 
-It is intended to make storage behavior explicit for:
-- contract debugging
-- off-chain indexer development
-- future schema migrations
-- contributor onboarding
+It is intended to answer two questions quickly:
+
+1. Which keys does each contract persist on-chain?
+2. How long do those keys stay durable without operator intervention?
 
 ## Scope
 
 Contracts in this workspace:
+
 - `arena`
 - `factory`
 - `payout`
@@ -18,231 +19,170 @@ Contracts in this workspace:
 
 ## Workspace Summary
 
-| Contract | Uses storage? | Storage key schema | TTL policy |
+| Contract | Storage model | Persistent TTL policy | Instance TTL policy |
 | --- | --- | --- | --- |
-| `arena` | Yes | `DataKey` enum (persistent) + symbol keys (instance) | Explicit bump on every write |
-| `factory` | Yes | Symbol keys (instance) | Instance-managed |
-| `payout` | No | None | None |
-| `staking` | No | None | None |
+| `arena` | Persistent `DataKey` entries plus symbol-based instance config | Explicitly bumped on every persistent write to a 31-day target | Host-managed instance TTL; no manual bump |
+| `factory` | Persistent `DataKey` records plus symbol-based instance config | No explicit bump; entries rely on Soroban's normal persistent TTL lifecycle | Host-managed instance TTL; no manual bump |
+| `payout` | Mixed persistent receipt data plus instance config and idempotency guards | `Payout(...)` and `SplitPayout(...)` are explicitly bumped; `PayoutHistory(...)` and `ArenaPayout(...)` are not | `execute_payout` and `distribute_split_payout` extend instance TTL to the same 31-day target |
+| `staking` | Persistent per-staker/per-host records plus symbol-based instance config | No explicit bump; entries rely on Soroban's normal persistent TTL lifecycle | Host-managed instance TTL; no manual bump |
 
-## Storage Key Inventory
+## Arena
 
-### Arena Contract
+Primary source: `contract/arena/src/lib.rs`
 
-File: `contract/arena/src/lib.rs`
+### Storage layout
 
-#### Persistent storage (`env.storage().persistent()`)
+Persistent keys:
 
-| `DataKey` variant | Value type | Description |
-| --- | --- | --- |
-| `DataKey::Config` | `ArenaConfig` | Round speed configuration; written once on `init` |
-| `DataKey::Round` | `RoundState` | Active round state (number, ledgers, submission count, flags) |
-| `DataKey::Submission(round_number, player)` | `Choice` | A player's Heads/Tails choice for a given round (bounded per round — see `contract/BOUNDS.md`) |
-| `DataKey::Survivor(player)` | `()` | Marker set when a player successfully joins; used to verify eligibility in `claim` |
-| `DataKey::Eliminated(player)` | `bool` | Marker set when a player is eliminated by `resolve_round`; used by `submit_choice` to return `PlayerEliminated` instead of `NotASurvivor` |
-| `DataKey::PrizeClaimed(winner)` | `i128` | Records the prize amount claimed by the winner; prevents double-claim |
+- `Config`: arena configuration, including round speed, stake amount, join deadline, and yield-share settings
+- `Round`: current round state
+- `Submission(round, player)`: player choice for a round
+- `Survivor(player)`: membership marker for joined players
+- `Eliminated(player)`: elimination marker
+- `PrizeClaimed(winner)`: prize-claim guard
+- `Metadata(arena_id)`, `Refunded(player)`, and other game-state entries in the same `DataKey` enum
 
-#### Instance storage (`env.storage().instance()`)
+Instance keys:
 
-| Symbol key | Value type | Description |
-| --- | --- | --- |
-| `ADMIN` | `Address` | Contract admin; set once via `initialize` |
-| `P_HASH` | `BytesN<32>` | WASM hash pending upgrade via 48-hour timelock |
-| `P_AFTER` | `u64` | Earliest timestamp at which `execute_upgrade` may be called |
-| `TOKEN` | `Address` | SAC token contract used for stake deposits and prize payouts; set via `set_token` |
-| `S_COUNT` | `u32` | Running count of survivors registered via `join`; incremented on each successful join |
-| `PRIZE` | `i128` | Accumulated prize pool; incremented by each player's stake on `join`, zeroed on `claim` |
-| `G_FIN` | `bool` | Permanently `true` after a successful `claim`; blocks any further claim attempts |
+- `ADMIN`, `TOKEN`, `CAPACITY`, `POOL`, `YIELD`, `WY_BPS`, `S_COUNT`
+- `P_HASH`, `P_AFTER` for upgrade timelock
+- `P_ADMIN`, `A_EXP` for admin transfer
+- `PAUSED`, `STATE`, `WINNER`, `FACTORY`, `CREATOR`, vault-related keys
 
-### Factory Contract
+### TTL policy
 
-File: `contract/factory/src/lib.rs`
-
-Instance storage only:
-
-| Symbol key | Value type | Description |
-| --- | --- | --- |
-| `ADMIN` | `Address` | Contract admin |
-| `P_HASH` | `BytesN<32>` | WASM hash pending upgrade |
-| `P_AFTER` | `u64` | Upgrade timelock timestamp |
-
-### Payout and Staking Contracts
-
-No custom Soroban storage keys are currently defined or used.
-
-## Access Pattern Matrix
-
-### Arena contract
-
-| Function | Keys read | Keys written | TTL bumped |
+| Storage class | Keys | Explicit bump? | Policy |
 | --- | --- | --- | --- |
-| `init` | — | `Config`, `Round` | `Config`, `Round` |
-| `start_round` | `Config`, `Round` | `Round` | `Round` |
-| `submit_choice` | `Round`, `Submission(n, player)` | `Submission(n, player)`, `Round` | `Submission(n, player)`, `Round` |
-| `timeout_round` | `Round` | `Round` | `Round` |
-| `resolve_round` | `Round`, `HeadsSubmitters(n)`, `TailsSubmitters(n)`, `Survivor(player)` | `Round`, remove `Survivor(player)`, write `Eliminated(player)`, update `S_COUNT` (instance) | `Round`, `Eliminated(player)` |
-| `get_config` | `Config` | — | — |
-| `get_round` | `Round` | — | — |
-| `get_choice` | `Submission(n, player)` | — | — |
-| `join` | `TOKEN`, `CAPACITY`, `S_COUNT`, `PRIZE` (instance), `Survivor(player)` | `Survivor(player)`, `S_COUNT`, `PRIZE` (instance) | `Survivor(player)` |
-| `set_token` ¹ | `ADMIN` (instance) | `TOKEN` (instance) | — |
-| `survivor_count` | `S_COUNT` (instance) | — | — |
-| `claim` | `G_FIN`, `S_COUNT`, `Survivor(winner)`, `PrizeClaimed(winner)`, `PRIZE`, `TOKEN` | `PrizeClaimed(winner)`, `PRIZE`, `G_FIN` (instance) | `PrizeClaimed(winner)` |
-| `initialize` | `ADMIN` (instance) | `ADMIN` (instance) | — |
-| `propose_upgrade` ¹ | `ADMIN` (instance) | `P_HASH`, `P_AFTER` (instance) | — |
-| `execute_upgrade` ¹ | `ADMIN`, `P_AFTER`, `P_HASH` (instance) | removes `P_HASH`, `P_AFTER` (instance) | — |
-| `cancel_upgrade` ¹ | `ADMIN`, `P_HASH` (instance) | removes `P_HASH`, `P_AFTER` (instance) | — |
-| `set_capacity` | `ADMIN` (instance) | `CAPACITY` (instance) | — |
-| `get_arena_state` | `S_COUNT`, `CAPACITY` (instance), `Round` | — | — |
-| `get_user_state` | `Survivor(player)`, `Winner(player)` | — | — |
-
-¹ Exempt from the global pause check — see [Emergency Pause Policy](#emergency-pause-policy) below.
-
-## View Functions
-
-These read-only functions expose aggregated contract state for frontend clients and indexers. They require no authorization and do not modify state.
-
-### `get_user_state(player: Address) → Result<UserStateView, ArenaError>`
-
-Returns a snapshot of a single player's participation status.
-
-**Return type: `UserStateView`**
-
-| Field | Type | Description |
-| --- | --- | --- |
-| `is_survivor` | `bool` | `true` if the player has a `Survivor` entry (has joined the arena) |
-| `has_submitted` | `bool` | `true` if the player has submitted a choice for the current round |
-| `choice` | `Choice` | The player's `Heads`/`Tails` submission (only meaningful when `has_submitted` is `true`) |
-| `has_claimed` | `bool` | `true` if the player has already claimed their prize via `claim()` |
-
-**Errors**: `ArenaError::NotInitialized` if `init` has not been called.
-
-### `get_full_state() → Result<FullStateView, ArenaError>`
-
-Returns a combined snapshot of the entire contract state in a single call, reducing the number of RPC round-trips needed by the frontend.
-
-**Return type: `FullStateView`**
-
-| Field | Type | Description |
-| --- | --- | --- |
-| `config` | `ArenaConfig` | Current round speed configuration (see `ArenaConfig`) |
-| `round` | `RoundState` | Current round state (see `RoundState`) |
-| `is_paused` | `bool` | Whether the contract is currently paused |
-
-**Errors**: `ArenaError::NotInitialized` if `init` has not been called.
-
-## TTL Policy Baseline
-
-All **persistent** storage entries in the arena contract are explicitly extended on
-every write. The policy constants are defined in `contract/arena/src/lib.rs`:
-
-| Constant | Value (ledgers) | Approximate wall-clock duration |
-| --- | --- | --- |
-| `GAME_TTL_THRESHOLD` | 100,000 | ~5.8 days (at 5 s/ledger) |
-| `GAME_TTL_EXTEND_TO` | 535,680 | ~31 days (at 5 s/ledger) |
-
-**Rule**: A `bump(env, key)` helper calls `storage().persistent().extend_ttl(key,
-GAME_TTL_THRESHOLD, GAME_TTL_EXTEND_TO)` immediately after every
-`storage().persistent().set()`. This ensures the TTL is extended to at least
-`GAME_TTL_EXTEND_TO` ledgers from the current ledger whenever it would fall below
-`GAME_TTL_THRESHOLD`, covering the maximum possible game duration.
-
-**Instance storage** (admin key, upgrade proposal keys) relies on the automatic
-instance TTL managed by the Soroban host and is not explicitly bumped by game logic.
-
-**Factory/payout/staking** contracts do not use persistent storage for game state.
-
-## ER-Style State Diagram
-
-```
-ArenaConfig (1)
-    │ round_speed_in_ledgers
-    │
-    └──────────────────────────────────────────────────┐
-                                                       │ governs deadline
-RoundState (1)                                         │
-    │ round_number                                     │
-    │ round_start_ledger ──────────────────────────────┘
-    │ round_deadline_ledger
-    │ active
-    │ timed_out
-    │ total_submissions
-    │
-    └─── has many ───► Submission(round_number, player_address)
-                           │ Choice { Heads | Tails }
-```
-
-Round lifecycle state machine:
-
-```
-[not initialised]
-    │ init()
-    ▼
-[Config set, Round { active: false }]
-    │ start_round()
-    ▼
-[Round { active: true }]
-    │ submit_choice()  (multiple callers, within deadline)
-    │ timeout_round()  (any caller, after deadline)
-    ▼
-[Round { active: false, timed_out: true }]
-    │ start_round()
-    ▼
-[Round { active: true, round_number + 1 }] ...
-```
-
-## Emergency Pause Policy
-
-### Overview
-
-The arena contract exposes a global pause mechanism (`pause` / `unpause`, admin-only).
-When paused, all state-mutating game functions reject calls with `ArenaError::Paused`.
-
-**However, governance/upgrade functions and admin-only recovery configuration are explicitly exempt from the pause check.**
-
-### Exempt functions
-
-| Function | Pause exempt? | Reason |
-| --- | --- | --- |
-| `propose_upgrade` | **Yes** | Admin must be able to queue a recovery upgrade at any time |
-| `execute_upgrade` | **Yes** | Admin must be able to deploy the recovery upgrade after the timelock |
-| `cancel_upgrade` | **Yes** | Admin must be able to retract an incorrect proposal before correcting it |
-| `set_token` | **Yes** | Admin must be able to rotate a compromised token address while gameplay is paused |
-| `pause` | **Yes** | Admin must always be able to pause |
-| `unpause` | **Yes** | Admin must always be able to unpause |
-
-### Non-exempt functions (blocked when paused)
-
-| Function | Blocked when paused? |
-| --- | --- |
-| `start_round` | Yes |
-| `submit_choice` | Yes |
-| `timeout_round` | Yes |
-| `join` | Yes |
-| `claim` | Yes |
+| Persistent | All arena `DataKey` entries written through the game flow | Yes | `bump(env, key)` calls `persistent().extend_ttl(key, 100_000, 535_680)` after every persistent write |
+| Instance | Admin/config/governance symbols | No | Relies on Soroban instance TTL management |
 
 ### Rationale
 
-A global pause is an emergency safety measure (e.g. to halt activity during a
-critical bug discovery). If the pause also blocked upgrade functions, a paused
-contract could become permanently locked with no recovery path. By keeping
-governance functions exempt, the admin retains full ability to:
+Arena state can remain live for days while rounds advance or while a winner delays
+claiming. The contract therefore actively extends persistent TTL on write so the
+game state stays durable without requiring an operator to manually restore it.
 
-1. Propose a corrective WASM upgrade while the contract is paused.
-2. Wait for the 48-hour timelock to elapse.
-3. Execute the upgrade and restore normal operation.
-4. Unpause.
+## Factory
 
-### Invariant
+Primary source: `contract/factory/src/lib.rs`
 
-> `propose_upgrade`, `execute_upgrade`, `cancel_upgrade`, and `set_token` MUST
-> NOT call `require_not_paused`. Any future addition of new governance or
-> admin-only recovery functions should follow the same exemption rule and update
-> this table.
+### Storage layout
 
-## Historical baseline note
+Persistent keys:
 
-Prior to the implementation of game state storage and TTL management, the accurate
-storage model for this workspace was:
+- `SupportedToken(address)`: allowed pool currencies
+- `Pool(pool_id)`: immutable arena metadata snapshot
+- `ArenaRef(arena_id)`: address, status, and host for cursor-based discovery
+- `ArenaWhitelist(arena_id, address)`: allowlist entries for private arenas
 
-> No custom Soroban storage keys are currently defined or used.
+Instance keys:
+
+- `ADMIN`, `P_ADMIN`, `A_EXP`
+- `P_HASH`, `P_AFTER` for upgrade timelock
+- `MIN_STK`, `AR_WASM`, `P_CNT`, `S_VER`, `PAUSED`
+- `TOK_CNT`, `MAX_PLR`, `STAKING`, `HST_MIN`
+- `FEE_BPS`, `P_FEE`, `F_AFTER`
+- `CR_FEE`, `CR_TOK`, `CR_ACC`, `WIN_ACC`
+
+### TTL policy
+
+| Storage class | Keys | Explicit bump? | Policy |
+| --- | --- | --- | --- |
+| Persistent | `SupportedToken`, `Pool`, `ArenaRef`, `ArenaWhitelist` | No | All entries rely on Soroban's default persistent TTL behavior |
+| Instance | Governance/config counters and fee settings | No | Relies on Soroban instance TTL management |
+
+### Rationale
+
+Factory state is mostly registry/config data rather than rapidly mutating
+round-by-round state. Operators should treat factory persistent entries as
+durable only while their Soroban TTL remains active, because the contract does
+not currently refresh those keys on writes or reads.
+
+## Payout
+
+Primary source: `contract/payout/src/lib.rs`
+
+### Storage layout
+
+Persistent keys:
+
+- `Payout(ctx, pool_id, round_id, winner)`: idempotent payout receipts
+- `SplitPayout(arena_id, winner)`: per-winner split payout receipts
+- `PayoutHistory(index)`: append-only payout history
+- `ArenaPayout(arena_id)`: latest payout receipt keyed by arena
+
+Instance keys:
+
+- `ADMIN`, `P_ADMIN`, `A_EXP`, `TREAS`, `FACTORY`, `PAUSED`
+- `P_HASH`, `P_AFTER` for upgrade timelock
+- `P_COUNT`: payout-history cursor
+- `CurrencyToken(symbol)`: symbol-to-token-address registry
+- `PrizePayout(game_id)`, `SplitPayoutBatch(arena_id)`: idempotency guards
+
+### TTL policy
+
+| Storage class | Keys | Explicit bump? | Policy |
+| --- | --- | --- | --- |
+| Persistent | `Payout(...)`, `SplitPayout(...)` | Yes | Extended with `persistent().extend_ttl(key, 100_000, 535_680)` when written |
+| Persistent | `PayoutHistory(...)`, `ArenaPayout(...)` | No | Written without a follow-up TTL extension |
+| Instance | Whole contract instance during payout execution paths | Yes, selectively | `execute_payout` and `distribute_split_payout` call `instance().extend_ttl(100_000, 535_680)` |
+| Instance | Governance/config/idempotency keys outside those flows | No direct per-key bump | Relies on the contract instance still being alive |
+
+### Rationale
+
+Payout keeps the receipt families that are queried most often alive explicitly,
+but its history index and arena lookup records are only as durable as their base
+persistent TTL. If long-term payout history matters operationally, index it
+off-chain instead of assuming the on-chain history keys will live forever.
+
+## Staking
+
+Primary source: `contract/staking/src/lib.rs`
+
+### Storage layout
+
+Persistent keys:
+
+- `Stake(address)` and `Position(address)`: staker balances and share positions
+- `HostLock(host, arena_id)` and `HostLockedTotal(host)`: host collateral locks
+- `RewardDebt(address)`, `PendingRewards(address)`, `StakedAt(address)`
+- `TotalClaimedRewards(address)`
+
+Instance keys:
+
+- `ADMIN`, `P_ADMIN`, `A_EXP`, `PAUSED`
+- `TOKEN`, `FACTRY`, `TSTAKE`, `TSHARES`
+- `P_HASH`, `P_AFTER` for upgrade timelock
+- `LOCK_SEC`, `MIN_STK`, `MAX_STK`
+- `RWD_EN`, `RWD_PSH`, `RWD_POOL`, `RWD_UNA`
+
+### TTL policy
+
+| Storage class | Keys | Explicit bump? | Policy |
+| --- | --- | --- | --- |
+| Persistent | All staking `DataKey` entries | No | Relies on Soroban's default persistent TTL behavior |
+| Instance | Config, totals, reward settings, governance state | No | Relies on Soroban instance TTL management |
+
+### Rationale
+
+Staking stores long-lived balances and reward accounting, but today it does not
+refresh TTL explicitly. Operators should plan around Soroban TTL restoration for
+staking state if positions are expected to remain untouched for long periods.
+
+## Shared Upgrade Timelock Flow
+
+The four contracts now share the same reusable helper module in
+`contract/shared/upgrade.rs`.
+
+Common flow:
+
+1. `propose_upgrade(new_hash)` stores `P_HASH` and `P_AFTER`, then emits
+   `UP_PROP`.
+2. `execute_upgrade(expected_hash)` checks the stored proposal, clears it,
+   emits `UP_EXEC`, and then upgrades the current contract WASM.
+3. `cancel_upgrade()` clears the pending proposal and emits `UP_CANC`.
+4. `pending_upgrade()` returns `(hash, execute_after)` only when both keys are
+   present.
+
+Factory keeps its additional malformed-state guard; arena keeps its stricter
+"strictly after" execution boundary to preserve existing behavior.

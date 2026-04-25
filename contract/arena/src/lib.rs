@@ -4,6 +4,13 @@ use soroban_sdk::{IntoVal,
     Address, Bytes, BytesN, Env, String, Symbol, Vec, contract, contracterror, contractimpl,
     contracttype, panic_with_error, symbol_short, token,
 };
+#[path = "../../shared/upgrade.rs"]
+mod upgrade_utils;
+use upgrade_utils::{
+    ExecuteTimePolicy, UpgradeErrors, UpgradeKeys, UpgradeTopics, cancel_upgrade as cancel_upgrade_flow,
+    execute_upgrade as execute_upgrade_flow, pending_upgrade as pending_upgrade_flow,
+    propose_upgrade as propose_upgrade_flow,
+};
 
 mod bounds;
 #[cfg(test)]
@@ -1522,21 +1529,22 @@ impl ArenaContract {
     pub fn propose_upgrade(env: Env, new_wasm_hash: BytesN<32>) -> Result<(), ArenaError> {
         let admin = Self::admin(env.clone());
         admin.require_auth();
-        if env.storage().instance().has(&PENDING_HASH_KEY) {
-            return Err(ArenaError::UpgradeAlreadyPending);
-        }
-        let execute_after = env.ledger().timestamp() + TIMELOCK_PERIOD;
-        env.storage()
-            .instance()
-            .set(&PENDING_HASH_KEY, &new_wasm_hash);
-        env.storage()
-            .instance()
-            .set(&EXECUTE_AFTER_KEY, &execute_after);
-        env.events().publish(
-            (TOPIC_UPGRADE_PROPOSED,),
-            (EVENT_VERSION, new_wasm_hash.clone(), execute_after),
-        );
-        Ok(())
+        propose_upgrade_flow(
+            &env,
+            UpgradeKeys {
+                pending_hash: &PENDING_HASH_KEY,
+                execute_after: &EXECUTE_AFTER_KEY,
+            },
+            UpgradeTopics {
+                proposed: &TOPIC_UPGRADE_PROPOSED,
+                executed: &TOPIC_UPGRADE_EXECUTED,
+                cancelled: &TOPIC_UPGRADE_CANCELLED,
+            },
+            EVENT_VERSION,
+            TIMELOCK_PERIOD,
+            &new_wasm_hash,
+            ArenaError::UpgradeAlreadyPending,
+        )
     }
 
     pub fn execute_upgrade(env: Env, expected_hash: BytesN<32>) -> Result<(), ArenaError> {
@@ -1546,28 +1554,27 @@ impl ArenaContract {
             .get(&ADMIN_KEY)
             .ok_or(ArenaError::NotInitialized)?;
         admin.require_auth();
-        let execute_after: u64 = env
-            .storage()
-            .instance()
-            .get(&EXECUTE_AFTER_KEY)
-            .ok_or(ArenaError::NoPendingUpgrade)?;
-        if env.ledger().timestamp() <= execute_after {
-            return Err(ArenaError::TimelockNotExpired);
-        }
-        let stored_hash: BytesN<32> = env
-            .storage()
-            .instance()
-            .get(&PENDING_HASH_KEY)
-            .ok_or(ArenaError::NoPendingUpgrade)?;
-        if stored_hash != expected_hash {
-            return Err(ArenaError::HashMismatch);
-        }
-        env.storage().instance().remove(&PENDING_HASH_KEY);
-        env.storage().instance().remove(&EXECUTE_AFTER_KEY);
-        env.events().publish(
-            (TOPIC_UPGRADE_EXECUTED,),
-            (EVENT_VERSION, stored_hash.clone()),
-        );
+        let stored_hash = execute_upgrade_flow(
+            &env,
+            UpgradeKeys {
+                pending_hash: &PENDING_HASH_KEY,
+                execute_after: &EXECUTE_AFTER_KEY,
+            },
+            UpgradeTopics {
+                proposed: &TOPIC_UPGRADE_PROPOSED,
+                executed: &TOPIC_UPGRADE_EXECUTED,
+                cancelled: &TOPIC_UPGRADE_CANCELLED,
+            },
+            EVENT_VERSION,
+            &expected_hash,
+            UpgradeErrors {
+                no_pending: ArenaError::NoPendingUpgrade,
+                timelock_not_expired: ArenaError::TimelockNotExpired,
+                hash_mismatch: ArenaError::HashMismatch,
+                malformed_state: None,
+            },
+            ExecuteTimePolicy::StrictlyAfter,
+        )?;
         env.deployer().update_current_contract_wasm(stored_hash);
         Ok(())
     }
@@ -1575,22 +1582,30 @@ impl ArenaContract {
     pub fn cancel_upgrade(env: Env) -> Result<(), ArenaError> {
         let admin = Self::admin(env.clone());
         admin.require_auth();
-        if !env.storage().instance().has(&PENDING_HASH_KEY) {
-            return Err(ArenaError::NoPendingUpgrade);
-        }
-        env.storage().instance().remove(&PENDING_HASH_KEY);
-        env.storage().instance().remove(&EXECUTE_AFTER_KEY);
-        env.events().publish((TOPIC_UPGRADE_CANCELLED,), (EVENT_VERSION,));
-        Ok(())
+        cancel_upgrade_flow(
+            &env,
+            UpgradeKeys {
+                pending_hash: &PENDING_HASH_KEY,
+                execute_after: &EXECUTE_AFTER_KEY,
+            },
+            UpgradeTopics {
+                proposed: &TOPIC_UPGRADE_PROPOSED,
+                executed: &TOPIC_UPGRADE_EXECUTED,
+                cancelled: &TOPIC_UPGRADE_CANCELLED,
+            },
+            EVENT_VERSION,
+            ArenaError::NoPendingUpgrade,
+        )
     }
 
     pub fn pending_upgrade(env: Env) -> Option<(BytesN<32>, u64)> {
-        let hash: Option<BytesN<32>> = env.storage().instance().get(&PENDING_HASH_KEY);
-        let after: Option<u64> = env.storage().instance().get(&EXECUTE_AFTER_KEY);
-        match (hash, after) {
-            (Some(h), Some(a)) => Some((h, a)),
-            _ => None,
-        }
+        pending_upgrade_flow(
+            &env,
+            UpgradeKeys {
+                pending_hash: &PENDING_HASH_KEY,
+                execute_after: &EXECUTE_AFTER_KEY,
+            },
+        )
     }
 
     pub fn state(env: Env) -> ArenaState {
