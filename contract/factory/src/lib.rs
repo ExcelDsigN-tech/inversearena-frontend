@@ -1053,6 +1053,11 @@ impl FactoryContract {
     /// the arena's admin (typically the pool creator who was set as admin during
     /// `create_pool`).
     ///
+    /// The `ArenaRef` entry is written once by `create_pool`; this function only
+    /// forwards the display metadata to the arena contract and does not touch
+    /// the registry key, keeping the flow idempotent and avoiding redundant
+    /// storage writes.
+    ///
     /// # Arguments
     /// * `arena_address` — address of the deployed arena contract.
     /// * `arena_id`      — application-level identifier stored inside the metadata.
@@ -1078,18 +1083,7 @@ impl FactoryContract {
                 host.into_val(&env),
             ],
         );
-
-        // Store the ArenaRef tracking structure initialized to Pending status.
-        let arena_ref = ArenaRef {
-            contract: arena_address,
-            status: ArenaStatus::Pending,
-            host: host.clone(),
-        };
-        let ref_key = DataKey::ArenaRef(arena_id);
-        env.storage()
-            .persistent()
-            .set(&ref_key, &arena_ref);
-        env.storage().persistent().extend_ttl(&ref_key, REGISTRY_TTL_THRESHOLD, REGISTRY_TTL_EXTEND_TO);
+        // ArenaRef is written once in create_pool; no duplicate write here.
     }
 
     pub fn get_arena_ref(env: Env, arena_id: u64) -> Result<ArenaRef, Error> {
